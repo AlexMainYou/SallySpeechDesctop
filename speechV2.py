@@ -17,7 +17,6 @@ CHUNK = 1024
 FORMAT = pyaudio.paFloat32
 CHANNELS = 1
 RATE = 16000
-BUFFER_SECONDS = 7  # Increased from 2 to 7 seconds
 
 # Initialize PyAudio
 p = pyaudio.PyAudio()
@@ -47,8 +46,8 @@ def record_audio():
         if is_recording:
             data = stream.read(CHUNK)
             audio_buffer.append(data)
-            
-            if len(audio_buffer) > int(RATE / CHUNK * BUFFER_SECONDS):
+        else:
+            if audio_buffer:
                 audio_data = b''.join(audio_buffer)
                 audio_array = np.frombuffer(audio_data, dtype=np.float32)
                 audio_buffer = []  # Clear the buffer
@@ -67,8 +66,7 @@ def record_audio():
                         time.sleep(0.001)  # 1ms delay between keypresses
                     kbd.press(' ')
                     kbd.release(' ')
-        else:
-            time.sleep(0.1)
+        time.sleep(0.01)
 
 # Start the keyboard listener
 listener = keyboard.Listener(on_press=on_press)
