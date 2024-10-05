@@ -6,8 +6,8 @@ import time
 from pynput import keyboard
 from pynput.keyboard import Controller
 
-# Load the Whisper model
-model = whisper.load_model("base")
+# Load the Whisper Turbo model
+model = whisper.load_model("large-v3-turbo")
 
 # Initialize the keyboard controller
 kbd = Controller()
@@ -55,6 +55,7 @@ def record_audio():
                 # Normalize audio to the range [-1, 1]
                 audio_array = audio_array / np.max(np.abs(audio_array))
                 
+                # Transcribe using Whisper Turbo
                 result = model.transcribe(audio_array, language="ru")
                 transcribed_text = result["text"].strip()
                 
