@@ -7,7 +7,7 @@ from pynput import keyboard
 from pynput.keyboard import Controller, Key
 
 # Load the Whisper Turbo model
-model = whisper.load_model("large-v3-turbo")
+model = whisper.load_model("large-v3-turbo", device="cuda")
 
 # Initialize the keyboard controller
 kbd = Controller()
