@@ -2,7 +2,6 @@
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
-import whisper
 import pyaudio
 import numpy as np
 import threading
@@ -10,8 +9,14 @@ import time
 from pynput import keyboard
 from pynput.keyboard import Controller, Key
 import warnings
+import requests
+import wave
+import io
+import tempfile
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+FIREWORKS_API_KEY = "YOUR_FIREWORKS_API_KEY"
 
 class RecordingIndicator(QWidget):
     def __init__(self):
@@ -38,7 +43,7 @@ class WhisperGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.initUI()
-        self.setup_whisper()
+        self.setup_audio()
         
     def initUI(self):
         self.setWindowTitle('Whisper Transcriber')
@@ -79,43 +84,41 @@ class WhisperGUI(QMainWindow):
         
         # Стилизация
         self.setStyleSheet("""
-    QMainWindow {
-        background-color: #1a212a;
-    }
-    QWidget {
-        background-color: #1a212a;
-        color: #ffffff;
-    }
-    QTextEdit {
-        background-color: #2d2d2d;
-        color: #ffffff;
-        border: 1px solid #3d3d3d;
-        border-radius: 5px;
-        padding: 5px;
-    }
-    QLabel {
-        color: #ffffff;
-    }
-    QPushButton {
-        background-color: #2d2d2d;
-        color: #ffffff;
-        border: 1px solid #3d3d3d;
-        border-radius: 3px;
-        padding: 5px 10px;
-        min-width: 80px;
-    }
-    QPushButton:hover {
-        background-color: #3d3d3d;
-        border: 1px solid #4d4d4d;
-    }
-    QPushButton:pressed {
-        background-color: #4d4d4d;
-    }
-""")
+            QMainWindow {
+                background-color: #202020;
+            }
+            QWidget {
+                background-color: #202020;
+                color: #ffffff;
+            }
+            QTextEdit {
+                background-color: #202020;
+                color: #ffffff;
+                border: 1px solid #3d3d3d;
+                border-radius: 5px;
+                padding: 5px;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QPushButton {
+                background-color: #202020;
+                color: #ffffff;
+                border: 1px solid #3d3d3d;
+                border-radius: 3px;
+                padding: 5px 10px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #202020;
+                border: 1px solid #4d4d4d;
+            }
+            QPushButton:pressed {
+                background-color: #202020;
+            }
+        """)
 
-    def setup_whisper(self):
-        # Инициализация всех компонентов из исходного кода
-        self.model = whisper.load_model("large-v3-turbo", device="cuda")
+    def setup_audio(self):
         self.kbd = Controller()
         self.is_recording = False
         self.audio_buffer = []
@@ -150,8 +153,41 @@ class WhisperGUI(QMainWindow):
         status = "Запись идет..." if self.is_recording else "Запись остановлена"
         self.status_label.setText(status)
 
+    def transcribe_audio(self, audio_data):
+        # Создаем временный WAV файл
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+            with wave.open(temp_wav.name, 'wb') as wf:
+                wf.setnchannels(self.CHANNELS)
+                wf.setsampwidth(4)  # для float32
+                wf.setframerate(self.RATE)
+                wf.writeframes(audio_data)
+
+        # Отправляем файл в API Fireworks
+        try:
+            with open(temp_wav.name, 'rb') as f:
+                response = requests.post(
+                    "https://audio-prod.us-virginia-1.direct.fireworks.ai/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {FIREWORKS_API_KEY}"},
+                    files={"file": f},
+                    data={
+                        "model": "whisper-v3",
+                        "temperature": "0",
+                        "vad_model": "silero"
+                    },
+                )
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('text', '').strip()
+            else:
+                print(f"Error: {response.status_code}", response.text)
+                return ''
+
+        except Exception as e:
+            print(f"Error during transcription: {str(e)}")
+            return ''
+
     def record_audio(self):
-        # Тот же код record_audio из исходного файла
         stream = self.p.open(format=self.FORMAT,
                            channels=self.CHANNELS,
                            rate=self.RATE,
@@ -165,13 +201,9 @@ class WhisperGUI(QMainWindow):
             else:
                 if self.audio_buffer:
                     audio_data = b''.join(self.audio_buffer)
-                    audio_array = np.frombuffer(audio_data, dtype=np.float32)
                     self.audio_buffer = []
                     
-                    audio_array = audio_array / np.max(np.abs(audio_array))
-                    
-                    result = self.model.transcribe(audio_array, language="ru")
-                    transcribed_text = result["text"].strip()
+                    transcribed_text = self.transcribe_audio(audio_data)
                     
                     if transcribed_text:
                         self.update_transcript.emit(transcribed_text)
@@ -182,7 +214,6 @@ class WhisperGUI(QMainWindow):
         stream.close()
 
     def type_text(self, text):
-        # Тот же код type_text из исходного файла
         self.kbd.press(Key.alt_l)
         self.kbd.press(Key.shift_l)
         self.kbd.release(Key.shift_l)
