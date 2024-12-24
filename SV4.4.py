@@ -11,8 +11,8 @@ from pynput.keyboard import Controller, Key
 import warnings
 import requests
 import wave
-import io
 import tempfile
+import os  # Для удаления временного файла
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -27,7 +27,7 @@ class RecordingIndicator(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         color = Qt.GlobalColor.red if self.is_recording else Qt.GlobalColor.gray
         painter.setBrush(QBrush(color))
         painter.setPen(Qt.PenStyle.NoPen)
@@ -44,45 +44,38 @@ class WhisperGUI(QMainWindow):
         super().__init__()
         self.initUI()
         self.setup_audio()
-        
+
     def initUI(self):
         self.setWindowTitle('Whisper Transcriber')
         self.setFixedSize(400, 200)
-        
-        # Создаем центральный виджет
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
-        # Главный layout
+
         layout = QVBoxLayout(central_widget)
-        
-        # Верхняя панель с индикатором и статусом
+
         top_panel = QHBoxLayout()
-        
+
         self.indicator = RecordingIndicator()
         top_panel.addWidget(self.indicator)
-        
+
         self.status_label = QLabel('Нажмите Insert для начала/остановки записи')
         top_panel.addWidget(self.status_label)
         top_panel.addStretch()
-        
-        # Кнопка копирования
+
         copy_button = QPushButton('Копировать')
         copy_button.setFixedWidth(100)
         copy_button.clicked.connect(self.copy_text)
         top_panel.addWidget(copy_button)
-        
+
         layout.addLayout(top_panel)
-        
-        # Поле для текста
+
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
         layout.addWidget(self.text_edit)
-        
-        # Подключаем сигнал обновления транскрипции
+
         self.update_transcript.connect(self.update_transcript_text)
-        
-        # Стилизация
+
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #202020;
@@ -123,20 +116,19 @@ class WhisperGUI(QMainWindow):
         self.is_recording = False
         self.audio_buffer = []
         self.program_running = True
-        
-        # Параметры аудио
+
         self.CHUNK = 1024
-        self.FORMAT = pyaudio.paFloat32
+        self.FORMAT = pyaudio.paInt16  # Изменено на paInt16
         self.CHANNELS = 1
         self.RATE = 16000
-        
+
         self.p = pyaudio.PyAudio()
-        
-        # Запуск потоков
+
         self.keyboard_listener = keyboard.Listener(on_press=self.on_press)
         self.keyboard_listener.start()
-        
+
         self.record_thread = threading.Thread(target=self.record_audio)
+        self.record_thread.daemon = True # Сделаем поток демоном, чтобы он завершался вместе с главным потоком
         self.record_thread.start()
 
     def on_press(self, key):
@@ -153,84 +145,104 @@ class WhisperGUI(QMainWindow):
         status = "Запись идет..." if self.is_recording else "Запись остановлена"
         self.status_label.setText(status)
 
-    def transcribe_audio(self, audio_data):
-        # Создаем временный WAV файл
+        if not self.is_recording and self.audio_buffer:
+            self.process_audio_buffer()
+
+    def process_audio_buffer(self):
+        audio_data = b''.join(self.audio_buffer)
+        self.audio_buffer = []
+
+        # Приведение типа данных к Int16, если использовался paFloat32.
+        # audio_np = np.frombuffer(audio_data, dtype=np.float32)
+        # audio_np = (audio_np * 32767).astype(np.int16)
+        # audio_data = audio_np.tobytes()
+
+        # Уменьшаем громкость, чтобы эмулировать работу VAD
+        audio_np = np.frombuffer(audio_data, dtype=np.int16)
+        audio_np = (audio_np * 0.5).astype(np.int16)  # Уменьшаем громкость на 50%
+        audio_data = audio_np.tobytes()
+
+        threading.Thread(target=self.send_for_transcription, args=(audio_data,)).start()
+
+    def send_for_transcription(self, audio_data):
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
             with wave.open(temp_wav.name, 'wb') as wf:
                 wf.setnchannels(self.CHANNELS)
-                wf.setsampwidth(4)  # для float32
+                wf.setsampwidth(self.p.get_sample_size(self.FORMAT))
                 wf.setframerate(self.RATE)
                 wf.writeframes(audio_data)
+            temp_wav_name = temp_wav.name
 
-        # Отправляем файл в API Fireworks
         try:
-            with open(temp_wav.name, 'rb') as f:
+            with open(temp_wav_name, 'rb') as f:
                 response = requests.post(
                     "https://audio-prod.us-virginia-1.direct.fireworks.ai/v1/audio/transcriptions",
                     headers={"Authorization": f"Bearer {FIREWORKS_API_KEY}"},
                     files={"file": f},
                     data={
                         "model": "whisper-v3",
-                        "temperature": "0",
-                        "vad_model": "silero"
+                        "temperature": "0.2",  # Немного увеличиваем temperature
+                        "vad_model": "silero",
+                        "language": "ru"
                     },
                 )
 
             if response.status_code == 200:
                 result = response.json()
-                return result.get('text', '').strip()
+                transcribed_text = result.get('text', '').strip()
+                if transcribed_text:
+                    self.update_transcript.emit(transcribed_text)
+                    # Вместо имитации ввода используем вставку в буфер обмена
+                    QApplication.clipboard().setText(transcribed_text + " ")
             else:
-                print(f"Error: {response.status_code}", response.text)
-                return ''
+                error_message = f"Error: {response.status_code} - {response.text}"
+                print(error_message)
+                self.update_transcript.emit(error_message)
 
         except Exception as e:
-            print(f"Error during transcription: {str(e)}")
-            return ''
+            error_message = f"Error during transcription: {str(e)}"
+            print(error_message)
+            self.update_transcript.emit(error_message)
+        finally:
+            os.remove(temp_wav_name)
 
     def record_audio(self):
-        stream = self.p.open(format=self.FORMAT,
-                           channels=self.CHANNELS,
-                           rate=self.RATE,
-                           input=True,
-                           frames_per_buffer=self.CHUNK)
+        stream = None  # Инициализируем stream как None
+        try:
+            stream = self.p.open(format=self.FORMAT,
+                                channels=self.CHANNELS,
+                                rate=self.RATE,
+                                input=True,
+                                frames_per_buffer=self.CHUNK)
 
-        while self.program_running:
-            if self.is_recording:
-                data = stream.read(self.CHUNK)
-                self.audio_buffer.append(data)
-            else:
-                if self.audio_buffer:
-                    audio_data = b''.join(self.audio_buffer)
-                    self.audio_buffer = []
-                    
-                    transcribed_text = self.transcribe_audio(audio_data)
-                    
-                    if transcribed_text:
-                        self.update_transcript.emit(transcribed_text)
-                        self.type_text(transcribed_text)
-            time.sleep(0.01)
-        
-        stream.stop_stream()
-        stream.close()
-
+            while self.program_running:
+                if self.is_recording:
+                    try:
+                        data = stream.read(self.CHUNK, exception_on_overflow=False)
+                        self.audio_buffer.append(data)
+                    except IOError as e:
+                        print(f"IOError during recording: {e}")
+                        if 'Input overflowed' in str(e):
+                            print("Input overflowed. Resetting stream.")
+                            stream.stop_stream()
+                            stream.close()
+                            stream = self.p.open(format=self.FORMAT,
+                                channels=self.CHANNELS,
+                                rate=self.RATE,
+                                input=True,
+                                frames_per_buffer=self.CHUNK)
+                        continue  # Продолжить цикл, даже если произошла ошибка
+                time.sleep(0.01)
+        except Exception as e:
+            print(f"Error during audio setup: {e}")
+        finally:
+            if stream:
+                stream.stop_stream()
+                stream.close()
+    
     def type_text(self, text):
-        self.kbd.press(Key.alt_l)
-        self.kbd.press(Key.shift_l)
-        self.kbd.release(Key.shift_l)
-        self.kbd.release(Key.alt_l)
-        time.sleep(0.1)
-        
-        for char in text:
-            self.kbd.type(char)
-            time.sleep(0.001)
-        
-        self.kbd.press(Key.space)
-        self.kbd.release(Key.space)
-        
-        self.kbd.press(Key.alt_l)
-        self.kbd.press(Key.shift_l)
-        self.kbd.release(Key.shift_l)
-        self.kbd.release(Key.alt_l)
+        # Изменено: Больше не имитируем ввод текста
+        pass
 
     def copy_text(self):
         clipboard = QApplication.clipboard()
@@ -242,6 +254,7 @@ class WhisperGUI(QMainWindow):
 
     def closeEvent(self, event):
         self.program_running = False
+        self.keyboard_listener.stop()  # Остановка слушателя клавиатуры
         self.p.terminate()
         event.accept()
 
