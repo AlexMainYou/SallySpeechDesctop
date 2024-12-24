@@ -3,12 +3,21 @@ from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 import pyaudio
+import numpy as np
 import threading
 import time
 from pynput import keyboard
-import subprocess
-import wave  # <--- Добавлен импорт модуля wave
+from pynput.keyboard import Controller, Key
+import warnings
+import requests
+import wave
 import os
+import subprocess
+import uuid
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+FIREWORKS_API_KEY = "YOUR_FIREWORKS_API_KEY"  # Замените на свой API ключ
 
 class RecordingIndicator(QWidget):
     def __init__(self):
@@ -29,26 +38,44 @@ class RecordingIndicator(QWidget):
         self.is_recording = state
         self.update()
 
-class AudioRecorder(QMainWindow):
+class WhisperGUI(QMainWindow):
+    update_transcript = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.initUI()
         self.setup_audio()
 
     def initUI(self):
-        self.setWindowTitle('Audio Recorder')
-        self.setFixedSize(200, 50)
+        self.setWindowTitle('Whisper Transcriber')
+        self.setFixedSize(400, 200)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
-        layout = QHBoxLayout(central_widget)
+        layout = QVBoxLayout(central_widget)
+
+        top_panel = QHBoxLayout()
 
         self.indicator = RecordingIndicator()
-        layout.addWidget(self.indicator)
+        top_panel.addWidget(self.indicator)
 
         self.status_label = QLabel('Нажмите Insert для начала/остановки записи')
-        layout.addWidget(self.status_label)
+        top_panel.addWidget(self.status_label)
+        top_panel.addStretch()
+
+        copy_button = QPushButton('Копировать')
+        copy_button.setFixedWidth(100)
+        copy_button.clicked.connect(self.copy_text)
+        top_panel.addWidget(copy_button)
+
+        layout.addLayout(top_panel)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        layout.addWidget(self.text_edit)
+
+        self.update_transcript.connect(self.update_transcript_text)
 
         self.setStyleSheet("""
             QMainWindow {
@@ -58,12 +85,35 @@ class AudioRecorder(QMainWindow):
                 background-color: #202020;
                 color: #ffffff;
             }
+            QTextEdit {
+                background-color: #202020;
+                color: #ffffff;
+                border: 1px solid #3d3d3d;
+                border-radius: 5px;
+                padding: 5px;
+            }
             QLabel {
                 color: #ffffff;
+            }
+            QPushButton {
+                background-color: #202020;
+                color: #ffffff;
+                border: 1px solid #3d3d3d;
+                border-radius: 3px;
+                padding: 5px 10px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #202020;
+                border: 1px solid #4d4d4d;
+            }
+            QPushButton:pressed {
+                background-color: #202020;
             }
         """)
 
     def setup_audio(self):
+        self.kbd = Controller()
         self.is_recording = False
         self.audio_buffer = []
         self.program_running = True
@@ -71,7 +121,7 @@ class AudioRecorder(QMainWindow):
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
-        self.RATE = 48000  # Увеличиваем частоту дискретизации для лучшего качества
+        self.RATE = 48000
 
         self.p = pyaudio.PyAudio()
 
@@ -97,14 +147,14 @@ class AudioRecorder(QMainWindow):
         self.status_label.setText(status)
 
         if not self.is_recording and self.audio_buffer:
-            self.save_audio()
+            self.process_audio_buffer()
 
-    def save_audio(self):
-        raw_filename = "recorded_audio_raw.wav"
-        output_filename = "recorded_audio.mp3"
+    def process_audio_buffer(self):
+        audio_filename = f"audio_{uuid.uuid4()}.mp3"
 
         # Сохраняем сырой PCM в WAV для последующего сжатия
-        with wave.open(raw_filename, 'wb') as wf:
+        raw_wav_filename = f"raw_{audio_filename}.wav"
+        with wave.open(raw_wav_filename, 'wb') as wf:
             wf.setnchannels(self.CHANNELS)
             wf.setsampwidth(self.p.get_sample_size(self.FORMAT))
             wf.setframerate(self.RATE)
@@ -114,23 +164,59 @@ class AudioRecorder(QMainWindow):
 
         # Сжимаем WAV в MP3 с помощью FFmpeg
         try:
-            # Используем LAME для кодирования в MP3, VBR для лучшего соотношения качество/размер
             subprocess.run([
                 'ffmpeg',
-                '-y',  # Перезаписывать выходной файл без запроса
-                '-f', 's16le',  # Формат входных данных
-                '-ar', str(self.RATE),  # Частота дискретизации
-                '-ac', str(self.CHANNELS),  # Количество каналов
-                '-i', raw_filename,  # Входной файл
-                '-c:a', 'libmp3lame',  # Использовать кодек LAME
-                '-q:a', '2',  # Качество VBR, 0 (лучшее) - 9 (худшее), 2 - хороший компромисс
-                output_filename  # Выходной файл
-            ], check=True)
-            print(f"Аудио сохранено в {output_filename}")
+                '-y',
+                '-f', 's16le',
+                '-ar', str(self.RATE),
+                '-ac', str(self.CHANNELS),
+                '-i', raw_wav_filename,
+                '-c:a', 'libmp3lame',
+                '-q:a', '2',
+                audio_filename
+            ], check=True, capture_output=True)
+
+            with open(audio_filename, 'rb') as f:
+              audio_data = f.read()
+
+            threading.Thread(target=self.send_for_transcription, args=(audio_data, audio_filename)).start()
+
         except subprocess.CalledProcessError as e:
             print(f"Ошибка при сжатии аудио: {e}")
+            self.update_transcript.emit(f"Ошибка при сжатии аудио: {e}")
         finally:
-            os.remove(raw_filename)  # Удаляем временный WAV файл
+            os.remove(raw_wav_filename)
+
+    def send_for_transcription(self, audio_data, audio_filename):
+        try:
+            with open(audio_filename, 'rb') as f:
+                response = requests.post(
+                    "https://audio-prod.us-virginia-1.direct.fireworks.ai/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {FIREWORKS_API_KEY}"},
+                    files={"file": f},
+                    data={
+                        "model": "whisper-v3",
+                        "temperature": "0.2",
+                        "vad_model": "silero",
+                        "language": "ru"
+                    },
+                )
+
+            if response.status_code == 200:
+                result = response.json()
+                transcribed_text = result.get('text', '').strip()
+                if transcribed_text:
+                    self.update_transcript.emit(transcribed_text)
+                    self.simulate_typing(transcribed_text + " ")
+            else:
+                error_message = f"Error: {response.status_code} - {response.text}"
+                print(error_message)
+                self.update_transcript.emit(error_message)
+
+        except Exception as e:
+            error_message = f"Error during transcription: {str(e)}"
+            print(error_message)
+            self.update_transcript.emit(error_message)
 
     def record_audio(self):
         stream = None
@@ -166,6 +252,19 @@ class AudioRecorder(QMainWindow):
                 stream.stop_stream()
                 stream.close()
 
+    def copy_text(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.text_edit.toPlainText())
+
+    def simulate_typing(self, text):
+        for char in text:
+            self.kbd.type(char)
+            time.sleep(0.01)  # Небольшая задержка между символами
+
+    @pyqtSlot(str)
+    def update_transcript_text(self, text):
+        self.text_edit.setText(text)
+
     def closeEvent(self, event):
         self.program_running = False
         self.keyboard_listener.stop()
@@ -174,6 +273,6 @@ class AudioRecorder(QMainWindow):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    ex = AudioRecorder()
+    ex = WhisperGUI()
     ex.show()
     sys.exit(app.exec())
