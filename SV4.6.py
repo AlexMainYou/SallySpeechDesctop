@@ -17,7 +17,7 @@ import uuid
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-FIREWORKS_API_KEY = "YOUR_FIREWORKS_API_KEY"  # Замените на свой API ключ
+FIREWORKS_API_KEY = "YOUR_FIREWORKS_API_KEY"
 
 class RecordingIndicator(QWidget):
     def __init__(self):
@@ -150,10 +150,14 @@ class WhisperGUI(QMainWindow):
             self.process_audio_buffer()
 
     def process_audio_buffer(self):
-        audio_filename = f"audio_{uuid.uuid4()}.mp3"
+        # Создаем папку temp в корневой директории программы, если её нет
+        temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+      
+        audio_filename = os.path.join(temp_dir, f"audio_{uuid.uuid4()}.mp3")
 
         # Сохраняем сырой PCM в WAV для последующего сжатия
-        raw_wav_filename = f"raw_{audio_filename}.wav"
+        raw_wav_filename = os.path.join(temp_dir, f"raw_{os.path.basename(audio_filename)}.wav")
         with wave.open(raw_wav_filename, 'wb') as wf:
             wf.setnchannels(self.CHANNELS)
             wf.setsampwidth(self.p.get_sample_size(self.FORMAT))
@@ -165,7 +169,7 @@ class WhisperGUI(QMainWindow):
         # Сжимаем WAV в MP3 с помощью FFmpeg
         try:
             subprocess.run([
-                'ffmpeg',
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ffmpeg', 'ffmpeg.exe'), # Полный путь до ffmpeg
                 '-y',
                 '-f', 's16le',
                 '-ar', str(self.RATE),
@@ -174,7 +178,7 @@ class WhisperGUI(QMainWindow):
                 '-c:a', 'libmp3lame',
                 '-q:a', '2',
                 audio_filename
-            ], check=True, capture_output=True)
+            ], check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
 
             with open(audio_filename, 'rb') as f:
               audio_data = f.read()
