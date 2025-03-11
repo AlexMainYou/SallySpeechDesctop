@@ -111,41 +111,61 @@ class WhisperGUI(QMainWindow):
         self.update_transcript.connect(self.update_transcript_text)
 
         self.setStyleSheet("""
-            QMainWindow {
-                background-color: #1E1E1E;
-            }
-            QWidget {
-                background-color: #1E1E1E;
-                color: #FFFFFF;
-            }
-            QTextEdit {
-                background-color: #2A2A2A;
-                color: #E0E0E0;
-                border: none;
-                border-radius: 8px;
-                padding: 8px;
-                selection-background-color: #404040;
-            }
-            QLabel {
-                color: #FFFFFF;
-                font-family: 'Segoe UI';
-            }
-            QPushButton {
-                background-color: #3A3A3A;
-                color: #FFFFFF;
-                border: none;
-                border-radius: 4px;
-                padding: 5px 10px;
-                font-family: 'Segoe UI';
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #454545;
-            }
-            QPushButton:pressed {
-                background-color: #303030;
-            }
-        """)
+    QMainWindow {
+        background-color: #1E1E1E;
+    }
+    QWidget {
+        background-color: #1E1E1E;
+        color: #FFFFFF;
+    }
+    QTextEdit {
+        background-color: #2A2A2A;
+        color: #E0E0E0;
+        border: none;
+        border-radius: 8px;
+        padding: 8px;
+        selection-background-color: #404040;
+    }
+    QTextEdit QScrollBar:vertical {
+        border: none;
+        background: #2A2A2A;       /* Фон полосы совпадает с QTextEdit */
+        width: 10px;
+        margin: 0px 0px 0px 0px;
+    }
+    QTextEdit QScrollBar::handle:vertical {
+        background: #505050;        /* Светло-серый ползунок для контраста */
+        min-height: 20px;
+        border-radius: 5px;
+    }
+    QTextEdit QScrollBar::add-line:vertical {
+        height: 0px;               /* Убираем кнопку "вниз" */
+    }
+    QTextEdit QScrollBar::sub-line:vertical {
+        height: 0px;               /* Убираем кнопку "вверх" */
+    }
+    QTextEdit QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+        background: none;          /* Прозрачный фон за пределами ползунка */
+    }
+    QLabel {
+        color: #FFFFFF;
+        font-family: 'Segoe UI';
+    }
+    QPushButton {
+        background-color: #3A3A3A;
+        color: #FFFFFF;
+        border: none;
+        border-radius: 4px;
+        padding: 5px 10px;
+        font-family: 'Segoe UI';
+        font-size: 12px;
+    }
+    QPushButton:hover {
+        background-color: #454545;
+    }
+    QPushButton:pressed {
+        background-color: #303030;
+    }
+""")
 
     def setup_audio(self):
         self.kbd = Controller()
@@ -232,7 +252,7 @@ class WhisperGUI(QMainWindow):
 
             self.audio_buffer = []
 
-            # Конвертируем в MP3
+            # Конвертируем в MP3 без появления консоли
             subprocess.run([
                 'ffmpeg',
                 '-i', wav_filename,
@@ -240,7 +260,7 @@ class WhisperGUI(QMainWindow):
                 '-q:a', '2',
                 '-y',
                 audio_filename
-            ], check=True, capture_output=True)
+            ], check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
 
             # Отправляем на транскрипцию
             self.send_for_transcription(audio_filename)
