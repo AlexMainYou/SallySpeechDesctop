@@ -1,1 +1,1 @@
-﻿start /b pythonw SV5.py
+start /b pythonw SV5.py

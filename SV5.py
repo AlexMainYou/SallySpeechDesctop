@@ -1,27 +1,49 @@
-﻿import sys
+import sys
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 import pyaudio
-# import numpy as np # numpy не используется напрямую в этом коде, можно убрать если не нужен для др. целей
+import numpy as np
 import threading
 import time
 from pynput import keyboard
-from pynput.keyboard import Controller, Key
 import warnings
-# import requests # УДАЛЕНО
 import wave
 import os
-# import subprocess # subprocess больше не нужен, если не конвертируем в MP3
+import subprocess
 import uuid
-import whisper
-import torch
-import traceback # Для детального вывода ошибок
+import ctypes
+from ctypes import wintypes
+from groq import APIConnectionError, APIStatusError, APITimeoutError, Groq
+# tempfile не используется для основной директории аудио, но может быть полезен для других временных нужд
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+def load_env_value(name, default=None):
+    app_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(app_dir, ".env")
+    try:
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip() == name:
+                    return value.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"Warning: could not read .env file: {e}")
+    return os.environ.get(name, default)
+
+GROQ_API_KEY = load_env_value("GROQ_API_KEY")
+GROQ_MODEL = "whisper-large-v3"
+TOGGLE_HOTKEY_LABEL = "Ctrl+Alt+Space"
+TRANSCRIPTION_AUDIO_RATE = 16000
+TRANSCRIPTION_AUDIO_BITRATE = "64k"
+
 MAX_STORED_AUDIO_FILES = 20
-WHISPER_MODEL_NAME = "large-v3" # Используем large-v3
 
 class RecordingIndicator(QWidget):
     def __init__(self):
@@ -76,13 +98,12 @@ class WhisperGUI(QMainWindow):
         self.signal_update_info.connect(self.update_info_label)
         self.signal_simulate_typing.connect(self.simulate_typing_slot)
 
-        self.whisper_model = None
         self.initUI()
         self.setup_audio()
-        self.load_whisper_model()
+
 
     def initUI(self):
-        self.setWindowTitle(f'Local Whisper Transcriber ({WHISPER_MODEL_NAME})')
+        self.setWindowTitle('Whisper Transcriber (whisper-v3)')
         self.setFixedSize(450, 250)
         
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -106,7 +127,7 @@ class WhisperGUI(QMainWindow):
         self.indicator = RecordingIndicator()
         control_layout.addWidget(self.indicator)
 
-        self.status_label = QLabel('Нажмите Insert для начала записи')
+        self.status_label = QLabel(f'Нажмите {TOGGLE_HOTKEY_LABEL} для начала записи')
         self.status_label.setFixedHeight(24)
         control_layout.addWidget(self.status_label)
         control_layout.addStretch()
@@ -127,46 +148,29 @@ class WhisperGUI(QMainWindow):
         info_layout = QHBoxLayout(info_panel)
         info_layout.setContentsMargins(5, 2, 5, 2)
 
-        self.info_label = QLabel('Загрузка...') # Начальное состояние
+        self.info_label = QLabel('Готов к записи')
         self.info_label.setStyleSheet('color: #888888; font-size: 11px;')
         info_layout.addWidget(self.info_label)
         info_layout.addStretch()
 
-        shortcut_label = QLabel('End - выход')
+        shortcut_label = QLabel(f'{TOGGLE_HOTKEY_LABEL} - запись, End - выход')
         shortcut_label.setStyleSheet('color: #888888; font-size: 11px;')
         info_layout.addWidget(shortcut_label)
 
         main_layout.addWidget(info_panel)
 
-    def load_whisper_model(self):
-        self.signal_update_info.emit(f"Загрузка модели Whisper '{WHISPER_MODEL_NAME}'...")
-        QApplication.processEvents()
-        try:
-            print(f"Loading Whisper model: {WHISPER_MODEL_NAME}...")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"Using device: {device}")
-            
-            self.whisper_model = whisper.load_model(WHISPER_MODEL_NAME, device=device)
-            
-            self.signal_update_info.emit(f"Модель Whisper '{WHISPER_MODEL_NAME}' загружена ({device}). Готов к записи.")
-            print(f"Whisper model '{WHISPER_MODEL_NAME}' loaded successfully on {device}.")
-        except Exception as e:
-            error_msg = f"Не удалось загрузить модель Whisper '{WHISPER_MODEL_NAME}': {e}\nУбедитесь, что 'openai-whisper' и 'torch' установлены. Для первой загрузки модели нужен интернет (или правильный файл в кеше)."
-            print(f"CRITICAL: {error_msg}")
-            traceback.print_exc()
-            self.signal_update_error.emit(error_msg)
-            # QMessageBox.critical(self, "Ошибка загрузки модели Whisper", error_msg) # Может быть слишком навязчиво при старте
-
     def setup_audio(self):
-        self.kbd = Controller()
         self.is_recording = False
         self.audio_buffer = []
         self.program_running = True
+        self.pressed_keys = set()
+        self.toggle_hotkey_active = False
+        self.groq_client = Groq(api_key=GROQ_API_KEY, timeout=90.0) if GROQ_API_KEY else None
 
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
-        self.RATE = 16000
+        self.RATE = 44100 
 
         try:
              self.p = pyaudio.PyAudio()
@@ -188,7 +192,7 @@ class WhisperGUI(QMainWindow):
             QMessageBox.critical(self, "Ошибка директории", critical_msg)
             sys.exit(1)
 
-        self.keyboard_listener = keyboard.Listener(on_press=self.on_press, daemon=True)
+        self.keyboard_listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release, daemon=True)
         self.keyboard_listener.start()
 
         self.record_thread = threading.Thread(target=self.record_audio_loop, daemon=True)
@@ -196,32 +200,48 @@ class WhisperGUI(QMainWindow):
 
     def on_press(self, key):
         try:
-            if key == keyboard.Key.insert:
-                if self.whisper_model is None:
-                    self.signal_update_error.emit("Модель Whisper не загружена. Запись невозможна.")
-                    return
-                QMetaObject.invokeMethod(self, "toggle_recording", Qt.ConnectionType.QueuedConnection)
-            elif key == keyboard.Key.end:
+            self.pressed_keys.add(key)
+
+            if key == keyboard.Key.end:
                 print("End key pressed, initiating shutdown...")
                 self.program_running = False
                 QMetaObject.invokeMethod(self, "close", Qt.ConnectionType.QueuedConnection)
                 return False 
+
+            if self.is_toggle_hotkey_pressed() and not self.toggle_hotkey_active:
+                self.toggle_hotkey_active = True
+                QMetaObject.invokeMethod(self, "toggle_recording", Qt.ConnectionType.QueuedConnection)
         except AttributeError:
             pass 
         except Exception as e: 
             print(f"Error in on_press handler: {e}")
-            traceback.print_exc()
 
+    def on_release(self, key):
+        try:
+            self.pressed_keys.discard(key)
+            if not self.is_toggle_hotkey_pressed():
+                self.toggle_hotkey_active = False
+        except Exception as e:
+            print(f"Error in on_release handler: {e}")
+
+    def is_toggle_hotkey_pressed(self):
+        ctrl_keys = {keyboard.Key.ctrl_l, keyboard.Key.ctrl_r, getattr(keyboard.Key, "ctrl", keyboard.Key.ctrl_l)}
+        alt_keys = {
+            keyboard.Key.alt_l,
+            keyboard.Key.alt_r,
+            getattr(keyboard.Key, "alt", keyboard.Key.alt_l),
+            getattr(keyboard.Key, "alt_gr", keyboard.Key.alt_r),
+        }
+        return (
+            keyboard.Key.space in self.pressed_keys
+            and bool(ctrl_keys & self.pressed_keys)
+            and bool(alt_keys & self.pressed_keys)
+        )
 
     @pyqtSlot() 
     def toggle_recording(self):
         if not self.program_running: 
              return
-        if self.whisper_model is None:
-            self.signal_update_error.emit("Модель Whisper не загружена. Запись невозможна.")
-            self.status_label.setText("Ошибка! Модель не загружена.")
-            self.info_label.setText("Ошибка загрузки модели")
-            return
 
         self.is_recording = not self.is_recording
         self.indicator.set_recording(self.is_recording) 
@@ -236,8 +256,8 @@ class WhisperGUI(QMainWindow):
                 self.status_label.setText("Ошибка! Не удалось начать запись.")
                 self.info_label.setText("Ошибка аудиоустройства")
         else:
-            self.status_label.setText("Нажмите Insert для начала записи")
-            self.info_label.setText("Обработка записи (локально)...")
+            self.status_label.setText(f"Нажмите {TOGGLE_HOTKEY_LABEL} для начала записи")
+            self.info_label.setText("Обработка записи...")
             self.stop_audio_stream() 
             audio_data_to_process = b''.join(self.audio_buffer)
             self.audio_buffer = [] 
@@ -247,8 +267,7 @@ class WhisperGUI(QMainWindow):
             else:
                  print("No audio data captured, skipping processing.")
                  self.info_label.setText("Запись пуста, обработка пропущена.")
-                 QTimer.singleShot(2000, lambda: self.update_info_label("Готов к записи") if self.program_running and self.whisper_model else None)
-
+                 QTimer.singleShot(2000, lambda: self.update_info_label("Готов к записи") if self.program_running else None)
 
     def start_audio_stream(self):
          if self.stream is not None:
@@ -263,7 +282,7 @@ class WhisperGUI(QMainWindow):
                  input=True,
                  frames_per_buffer=self.CHUNK
              )
-             print(f"Audio stream started successfully at {self.RATE} Hz.")
+             print("Audio stream started successfully.")
              return True
          except OSError as e:
              error_msg = f"Ошибка открытия аудиопотока (OSError): {e}. Устройство может быть занято."
@@ -274,7 +293,6 @@ class WhisperGUI(QMainWindow):
          except Exception as e:
              error_msg = f"Неизвестная ошибка при открытии аудиопотока: {e}"
              print(error_msg)
-             traceback.print_exc()
              self.signal_update_error.emit(error_msg)
              self.stream = None
              return False
@@ -283,13 +301,12 @@ class WhisperGUI(QMainWindow):
         if self.stream is not None:
             print("Stopping audio stream...")
             try:
-                if self.stream.is_active(): # Проверяем, активен ли поток перед остановкой
+                if self.stream.is_active():
                     self.stream.stop_stream()
                 self.stream.close()
                 print("Audio stream stopped and closed.")
             except Exception as e:
                 print(f"Error closing audio stream: {e}")
-                traceback.print_exc()
             finally:
                  self.stream = None 
         else:
@@ -304,33 +321,30 @@ class WhisperGUI(QMainWindow):
                     self.audio_buffer.append(data)
                 except IOError as e:
                     if e.errno == pyaudio.paInputOverflowed:
-                        # print("Input overflowed. Skipping frame.") # Можно раскомментировать для отладки
                         pass
-                    elif e.errno == -9988 or "Stream closed" in str(e): # paStreamIsStopped or similar
-                         print("Stream closed or stopped during read operation.")
+                    elif e.errno == -9988 or "Stream closed" in str(e):
+                         print("Stream closed during read operation.")
                          time.sleep(0.1) 
                     else:
                         error_msg = f"Audio recording IOError: {e}"
                         print(error_msg)
-                        traceback.print_exc()
                         self.signal_update_error.emit(error_msg)
                         QMetaObject.invokeMethod(self, "handle_recording_error", Qt.ConnectionType.QueuedConnection)
                         time.sleep(0.1) 
                 except Exception as e:
                     error_msg = f"Unexpected error in recording loop: {e}"
                     print(error_msg)
-                    traceback.print_exc()
                     self.signal_update_error.emit(error_msg)
                     QMetaObject.invokeMethod(self, "handle_recording_error", Qt.ConnectionType.QueuedConnection)
                     time.sleep(0.1)
             else:
-                time.sleep(0.02) # Небольшая задержка, чтобы не грузить CPU впустую
+                time.sleep(0.02)
         print("Audio recording loop finished.")
 
     @pyqtSlot()
     def handle_recording_error(self):
          print("Handling recording error in main thread.")
-         self.stop_audio_stream() # Убедимся, что поток остановлен
+         self.stop_audio_stream()
          self.is_recording = False
          self.indicator.set_recording(False)
          self.status_label.setText("Ошибка записи!")
@@ -340,11 +354,11 @@ class WhisperGUI(QMainWindow):
         directory = self.audio_storage_dir
         try:
             files_in_dir = os.listdir(directory)
-            audio_wav_files = [f for f in files_in_dir if f.startswith("audio_") and f.endswith(".wav")]
+            audio_mp3_files = [f for f in files_in_dir if f.startswith("audio_") and f.endswith(".mp3")]
             
-            if len(audio_wav_files) > max_files:
+            if len(audio_mp3_files) > max_files:
                 file_details = []
-                for f_name in audio_wav_files:
+                for f_name in audio_mp3_files:
                     f_path = os.path.join(directory, f_name)
                     try:
                         file_details.append((os.path.getmtime(f_path), f_path))
@@ -352,7 +366,7 @@ class WhisperGUI(QMainWindow):
                         print(f"File not found during management: {f_path}, skipping.")
                         continue
                 
-                file_details.sort(key=lambda x: x[0]) # Сортировка от старых к новым
+                file_details.sort(key=lambda x: x[0])
 
                 num_to_delete = len(file_details) - max_files
                 for i in range(num_to_delete):
@@ -364,7 +378,6 @@ class WhisperGUI(QMainWindow):
                         print(f"Error removing old audio file {old_file_path}: {e}")
         except Exception as e:
             print(f"Error managing stored audio files in {directory}: {e}")
-            traceback.print_exc()
 
     def process_audio_buffer(self, audio_data_to_process):
         if not audio_data_to_process:
@@ -372,66 +385,110 @@ class WhisperGUI(QMainWindow):
             self.signal_update_info.emit("Нет данных для обработки")
             return
 
-        self.signal_update_info.emit("Сохранение аудио...")
+        self.signal_update_info.emit("Сохранение и конвертация...")
 
         unique_id = uuid.uuid4()
-        wav_filename_for_transcription = os.path.join(self.audio_storage_dir, f"audio_{unique_id}.wav")
-        
+        wav_filename = os.path.join(self.audio_storage_dir, f"temp_{unique_id}.wav")
+        mp3_to_store_and_send = os.path.join(self.audio_storage_dir, f"audio_{unique_id}.mp3")
+
         try:
-            print(f"Saving WAV for transcription: {os.path.basename(wav_filename_for_transcription)}")
-            with wave.open(wav_filename_for_transcription, 'wb') as wf:
+            print(f"Saving WAV: {os.path.basename(wav_filename)}")
+            with wave.open(wav_filename, 'wb') as wf:
                 wf.setnchannels(self.CHANNELS)
                 wf.setsampwidth(self.p.get_sample_size(self.FORMAT))
                 wf.setframerate(self.RATE)
                 wf.writeframes(audio_data_to_process)
-            print(f"WAV for transcription saved successfully.")
+            print(f"WAV saved successfully.")
 
-            self.manage_stored_audio_files()
+            print(f"Starting conversion to MP3: {os.path.basename(mp3_to_store_and_send)}")
+            startupinfo = None
+            if os.name == 'nt': 
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
 
-            self.send_for_transcription(wav_filename_for_transcription)
+            ffmpeg_command = [
+                'ffmpeg', '-y', 
+                '-i', wav_filename,
+                '-vn', 
+                '-acodec', 'libmp3lame',
+                '-ab', TRANSCRIPTION_AUDIO_BITRATE, 
+                '-ar', str(TRANSCRIPTION_AUDIO_RATE),
+                '-ac', str(self.CHANNELS),
+                mp3_to_store_and_send
+            ]
+            
+            conversion_started_at = time.perf_counter()
+            process = subprocess.run(
+                ffmpeg_command,
+                check=True, 
+                capture_output=True, 
+                text=True, 
+                encoding='utf-8', 
+                startupinfo=startupinfo
+            )
+            
+            if process.returncode == 0:
+                 conversion_elapsed = time.perf_counter() - conversion_started_at
+                 print(f"MP3 conversion successful: {os.path.basename(mp3_to_store_and_send)} in {conversion_elapsed:.2f}s")
+                 self.manage_stored_audio_files() 
+            else:
+                 raise subprocess.CalledProcessError(process.returncode, ffmpeg_command, output=process.stdout, stderr=process.stderr)
 
+            # Передаем созданный MP3 файл в функцию транскрипции
+            self.send_for_transcription(mp3_to_store_and_send) # <--- Имя файла MP3
+
+        except FileNotFoundError:
+             error_message = "Ошибка: ffmpeg не найден. Установите ffmpeg и добавьте его в PATH."
+             print(error_message)
+             self.signal_update_error.emit(error_message)
+        except subprocess.CalledProcessError as e:
+            error_details = f"stderr: {e.stderr}\nstdout: {e.stdout}"
+            error_message = f"Ошибка конвертации ffmpeg (код {e.returncode}). См. консоль."
+            print(f"{error_message}\n{error_details}")
+            self.signal_update_error.emit(f"Ошибка ffmpeg: {e.stderr[:200]}...") 
         except Exception as e:
-            error_message = f"Ошибка сохранения WAV: {str(e)}"
+            error_message = f"Ошибка обработки аудио: {str(e)}"
             print(error_message)
-            traceback.print_exc()
             self.signal_update_error.emit(error_message)
+        finally:
+            try:
+                if os.path.exists(wav_filename):
+                    os.remove(wav_filename)
+            except OSError as e_rem:
+                print(f"Warning: Could not remove temp WAV file {os.path.basename(wav_filename)}: {e_rem}")
     
-    def send_for_transcription(self, audio_filename):
-        if not self.whisper_model:
-            self.signal_update_error.emit("Локальная модель Whisper не загружена.")
-            self.signal_update_info.emit("Модель не загружена")
-            print("Error: Whisper model not loaded.")
-            return
-
+    # --- Эта функция приведена к виду, максимально близкому к вашему исходному ---
+    def send_for_transcription(self, audio_filename): # Используем audio_filename как имя параметра
+        """Отправляет аудиофайл в API и обрабатывает ответ."""
         if not os.path.exists(audio_filename):
              print(f"Audio file not found for transcription: {audio_filename}")
              self.signal_update_info.emit("Файл аудио не найден")
              return
 
-        self.signal_update_info.emit(f"Локальное распознавание ({WHISPER_MODEL_NAME})...")
-        print(f"Sending {os.path.basename(audio_filename)} ({os.path.getsize(audio_filename)} bytes) for local transcription...")
-        
-        start_time = time.time()
+        self.signal_update_info.emit("Отправка на распознавание...")
+        print(f"Sending {os.path.basename(audio_filename)} ({os.path.getsize(audio_filename)} bytes) for transcription...")
+
         try:
-            use_fp16 = torch.cuda.is_available()
-            # Принудительно fp16=False для CPU
-            if self.whisper_model.device.type == "cpu": # Более надежная проверка типа устройства
-                use_fp16 = False
-            
-            print(f"Transcribing with: language='ru', fp16={use_fp16}, task='transcribe', device='{self.whisper_model.device.type}'")
+            if self.groq_client is None:
+                error_message = "Ошибка API: переменная окружения GROQ_API_KEY не задана."
+                print(error_message)
+                self.signal_update_error.emit(error_message)
+                return
 
-            result = self.whisper_model.transcribe(
-                audio_filename, 
-                language="ru", 
-                fp16=use_fp16,
-                task="transcribe"
-            )
-            
-            transcribed_text = result.get('text', '').strip()
-            end_time = time.time()
-            processing_time = end_time - start_time
-            print(f"Local transcription took {processing_time:.2f} seconds.")
+            with open(audio_filename, 'rb') as f:
+                transcription_started_at = time.perf_counter()
+                transcription = self.groq_client.audio.transcriptions.create(
+                    file=(os.path.basename(audio_filename), f.read()),
+                    model=GROQ_MODEL,
+                    temperature=0,
+                    response_format="verbose_json",
+                    language="ru",
+                )
+                transcription_elapsed = time.perf_counter() - transcription_started_at
+                print(f"Groq transcription completed in {transcription_elapsed:.2f}s")
 
+            transcribed_text = (getattr(transcription, "text", "") or "").strip()
 
             if transcribed_text:
                 self.update_transcript.emit(transcribed_text)
@@ -439,37 +496,115 @@ class WhisperGUI(QMainWindow):
             else:
                 print("Transcription result is empty.")
                 self.signal_update_info.emit("Распознан пустой текст (тишина?)")
-                QTimer.singleShot(2000, lambda: self.update_info_label("Готов к записи") if self.program_running and self.whisper_model else None)
+                QTimer.singleShot(2000, lambda: self.update_info_label("Готов к записи") if self.program_running else None)
 
-        except RuntimeError as e:
-            error_message = f"Ошибка во время локального распознавания (RuntimeError): {str(e)}"
+        except APITimeoutError:
+             error_message = "Ошибка API: Превышен таймаут ожидания ответа."
+             print(error_message)
+             self.signal_update_error.emit(error_message)
+        except APIStatusError as e:
+            error_message = f"Ошибка API ({e.status_code}): {e.response.text}"
             print(error_message)
-            traceback.print_exc()
             self.signal_update_error.emit(error_message)
-            if "CUDA" in str(e) and "out of memory" in str(e).lower():
-                 self.signal_update_info.emit("Ошибка CUDA: не хватает памяти. Попробуйте модель поменьше.")
-            elif "CUDA" in str(e):
-                 self.signal_update_info.emit("Ошибка CUDA. Убедитесь, что драйверы и PyTorch совместимы.")
+        except APIConnectionError as e:
+             error_message = f"Ошибка сети при запросе к API: {str(e)}"
+             print(error_message)
+             self.signal_update_error.emit(error_message)
         except Exception as e:
-            error_message = f"Неожиданная ошибка при локальной транскрипции: {str(e)}"
+            error_message = f"Неожиданная ошибка при обработке ответа API: {str(e)}"
             print(error_message)
-            traceback.print_exc()
             self.signal_update_error.emit(error_message)
 
     @pyqtSlot(str) 
     def simulate_typing_slot(self, text):
-         threading.Thread(target=self._simulate_typing_worker, args=(text,), daemon=True).start()
+         threading.Thread(target=self._insert_text_worker, args=(text,), daemon=True).start()
 
-    def _simulate_typing_worker(self, text):
-        print(f"Simulating typing: '{text[:50]}...'")
+    def _insert_text_worker(self, text):
+        print(f"Inserting transcription with Unicode input: '{text[:50]}...'")
         try:
-            for char in text:
-                self.kbd.type(char)
-                # Небольшая задержка между символами для более естественного ввода
-                time.sleep(0.010 + np.random.rand() * 0.010) if 'np' in globals() else time.sleep(0.015) # Добавил проверку np
+            time.sleep(0.05)
+            self._send_unicode_text(text)
         except Exception as e:
-            print(f"Error during typing simulation: {e}")
-            traceback.print_exc()
+            print(f"Error during Unicode text insertion: {e}")
+
+    def _send_unicode_text(self, text):
+        if os.name != 'nt':
+            raise RuntimeError("Unicode text insertion without clipboard is only implemented on Windows.")
+
+        input_keyboard = 1
+        keyeventf_keyup = 0x0002
+        keyeventf_unicode = 0x0004
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [
+                ("uMsg", wintypes.DWORD),
+                ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD),
+            ]
+
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [
+                ("mi", MOUSEINPUT),
+                ("ki", KEYBDINPUT),
+                ("hi", HARDWAREINPUT),
+            ]
+
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
+
+        user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+        user32.SendInput.restype = wintypes.UINT
+
+        def make_input(code_unit, key_up=False):
+            flags = keyeventf_unicode | (keyeventf_keyup if key_up else 0)
+            return INPUT(
+                type=input_keyboard,
+                ki=KEYBDINPUT(
+                    wVk=0,
+                    wScan=code_unit,
+                    dwFlags=flags,
+                    time=0,
+                    dwExtraInfo=0,
+                ),
+            )
+
+        utf16 = text.encode("utf-16-le")
+        code_units = [
+            int.from_bytes(utf16[i:i + 2], "little")
+            for i in range(0, len(utf16), 2)
+        ]
+
+        for start in range(0, len(code_units), 64):
+            events = []
+            for code_unit in code_units[start:start + 64]:
+                events.append(make_input(code_unit))
+                events.append(make_input(code_unit, key_up=True))
+
+            inputs = (INPUT * len(events))(*events)
+            sent = user32.SendInput(len(events), inputs, ctypes.sizeof(INPUT))
+            if sent != len(events):
+                raise ctypes.WinError(ctypes.get_last_error())
 
     @pyqtSlot(str) 
     def update_transcript_text(self, text):
@@ -478,32 +613,25 @@ class WhisperGUI(QMainWindow):
         self.text_edit.setText(new_text.strip())
         self.text_edit.moveCursor(QTextCursor.MoveOperation.End)
         self.info_label.setText("Транскрипция добавлена")
-        QTimer.singleShot(2000, lambda: self.update_info_label("Готов к записи") if self.program_running and self.whisper_model else None)
+        QTimer.singleShot(2000, lambda: self.update_info_label("Готов к записи") if self.program_running else None)
 
     @pyqtSlot(str) 
     def update_transcript_error(self, error_message):
         self.text_edit.append(f"<font color='#FF6B6B'><b>Ошибка:</b> {error_message}</font>")
         self.text_edit.moveCursor(QTextCursor.MoveOperation.End)
         self.info_label.setText("Произошла ошибка")
-        QTimer.singleShot(5000, lambda: self.update_info_label("Готов к записи") if self.program_running and self.whisper_model else None)
+        QTimer.singleShot(5000, lambda: self.update_info_label("Готов к записи") if self.program_running else None)
 
     @pyqtSlot(str) 
     def update_info_label(self, text):
-        if self.program_running:
-             if "Загрузка модели Whisper" in self.info_label.text() and "загружена" not in self.info_label.text() and self.whisper_model is None:
-                 if "Готов к записи" not in text:
-                     self.info_label.setText(text)
-             elif self.whisper_model is None and "Готов к записи" in text:
-                 pass
-             else:
-                self.info_label.setText(text)
-
+        if self.program_running: 
+             self.info_label.setText(text)
 
     def copy_text(self):
         clipboard = QApplication.clipboard()
         clipboard.setText(self.text_edit.toPlainText())
         self.info_label.setText("Текст скопирован")
-        QTimer.singleShot(2000, lambda: self.update_info_label("Готов к записи") if self.program_running and self.whisper_model else None)
+        QTimer.singleShot(2000, lambda: self.update_info_label("Готов к записи") if self.program_running else None)
 
     def closeEvent(self, event):
         print("Close event received. Shutting down...")
@@ -511,27 +639,12 @@ class WhisperGUI(QMainWindow):
 
         if hasattr(self, 'keyboard_listener') and self.keyboard_listener.is_alive():
              print("Stopping keyboard listener (will stop on next event or program exit as daemon)...")
-             # pynput listener.stop() может вызывать проблемы из потока, лучше дать ему завершиться как daemon
 
-        self.stop_audio_stream() # Убедимся, что аудиопоток остановлен
+        self.stop_audio_stream()
 
-        if hasattr(self, 'p') and self.p is not None: # Проверка, что p существует
+        if hasattr(self, 'p'):
              print("Terminating PyAudio...")
-             try:
-                self.p.terminate()
-             except Exception as e:
-                print(f"Error terminating PyAudio: {e}")
-             self.p = None # Явно обнуляем
-        
-        if self.whisper_model is not None:
-            print("Releasing Whisper model from memory...")
-            model_device_type = self.whisper_model.device.type
-            del self.whisper_model
-            self.whisper_model = None # Явно обнуляем
-            if model_device_type == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print("Whisper model released.")
-
+             self.p.terminate()
         print("Shutdown complete. Accepting close event.")
         event.accept()
 
@@ -618,25 +731,13 @@ if __name__ == '__main__':
         QLabel {
              font-size: 12px; 
         }
-        /* Для info_label и shortcut_label можно использовать objectName, если нужно */
-        /* self.info_label.setObjectName("infoLabel") */
-        /* #infoLabel { color: #888888; font-size: 11px; } */
+        #info_label QLabel, #shortcut_label QLabel { 
+            color: #888888;
+            font-size: 11px;
+        }
         QMainWindow {
         }
     """)
-    
-    # Проверка доступности CUDA при запуске
-    print("--- PyTorch CUDA Check ---")
-    if torch.cuda.is_available():
-        print(f"CUDA is available. PyTorch version: {torch.__version__}")
-        print(f"CUDA version by PyTorch: {torch.version.cuda}")
-        print(f"Number of GPUs: {torch.cuda.device_count()}")
-        for i in range(torch.cuda.device_count()):
-            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
-    else:
-        print(f"CUDA is NOT available. PyTorch version: {torch.__version__}")
-        print("PyTorch will use CPU. For GPU acceleration, ensure CUDA drivers and a CUDA-enabled PyTorch version are correctly installed.")
-    print("--------------------------")
 
     ex = WhisperGUI()
     ex.show()
