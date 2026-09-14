@@ -99,9 +99,7 @@ class RecordButton(QPushButton):
         else:
             painter.setBrush(QColor("white"))
             painter.drawRoundedRect(17, 9, 12, 19, 6, 6)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawArc(13, 16, 20, 19, 180 * 16, 180 * 16)
-            painter.drawLine(23, 35, 23, 31)
+            painter.drawLine(23, 34, 23, 30)
             painter.drawLine(18, 36, 28, 36)
 
 
