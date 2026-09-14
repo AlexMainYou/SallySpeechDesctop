@@ -21,8 +21,9 @@ import numpy as np
 import pyaudio
 from groq import APIConnectionError, APIStatusError, APITimeoutError, Groq
 from pynput import keyboard
-from PyQt6.QtCore import QMetaObject, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QMetaObject, QRectF, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import QApplication, QComboBox, QFileDialog, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget
 
 
@@ -67,6 +68,7 @@ class RecordButton(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Начать или остановить запись")
         self.setStyleSheet("QPushButton { border: 0; background: transparent; }")
+        self.microphone_icon = QSvgRenderer(os.path.join(get_app_dir(), "assets", "microphone_icon.svg"))
         self.phase = 0.0
         self.animation_timer = QTimer(self)
         self.animation_timer.timeout.connect(self.animate)
@@ -97,10 +99,7 @@ class RecordButton(QPushButton):
             painter.setBrush(QColor("white"))
             painter.drawRoundedRect(17, 17, 12, 12, 2, 2)
         else:
-            painter.setBrush(QColor("white"))
-            painter.drawRoundedRect(17, 9, 12, 19, 6, 6)
-            painter.drawLine(23, 34, 23, 30)
-            painter.drawLine(18, 36, 28, 36)
+            self.microphone_icon.render(painter, QRectF(4, 4, 38, 38))
 
 
 class MediaButton(QPushButton):
