@@ -3,3 +3,4 @@ pyaudio
 numpy
 pynput
 groq
+gigaam @ git+https://github.com/salute-developers/GigaAM.git

@@ -1,6 +1,7 @@
 ﻿__pycache__/
 *.py[cod]
 temp_audio/
+model_cache/
 .env
 *.log
 build/

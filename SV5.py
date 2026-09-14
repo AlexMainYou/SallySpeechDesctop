@@ -19,9 +19,15 @@ from groq import APIConnectionError, APIStatusError, APITimeoutError, Groq
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+def get_app_dir():
+    return (
+        os.path.dirname(sys.executable)
+        if getattr(sys, "frozen", False)
+        else os.path.dirname(os.path.abspath(__file__))
+    )
+
 def load_env_value(name, default=None):
-    app_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-    env_path = os.path.join(app_dir, ".env")
+    env_path = os.path.join(get_app_dir(), ".env")
     try:
         with open(env_path, "r", encoding="utf-8") as env_file:
             for raw_line in env_file:
@@ -39,9 +45,13 @@ def load_env_value(name, default=None):
 
 GROQ_API_KEY = load_env_value("GROQ_API_KEY")
 GROQ_MODEL = "whisper-large-v3"
-TOGGLE_HOTKEY_LABEL = "Ctrl+Alt+Space"
+GIGAAM_MODEL = "v3_e2e_rnnt"
+GIGAAM_ENGINE = "gigaam"
+GROQ_ENGINE = "groq"
+TOGGLE_HOTKEY_LABEL = "Правый Ctrl"
 TRANSCRIPTION_AUDIO_RATE = 16000
 TRANSCRIPTION_AUDIO_BITRATE = "64k"
+GIGAAM_MAX_SEGMENT_SECONDS = 24
 
 MAX_STORED_AUDIO_FILES = 20
 
@@ -103,8 +113,8 @@ class WhisperGUI(QMainWindow):
 
 
     def initUI(self):
-        self.setWindowTitle('Whisper Transcriber (whisper-v3)')
-        self.setFixedSize(450, 250)
+        self.setWindowTitle('Sally Speech')
+        self.setFixedSize(450, 285)
         
         script_dir = os.path.dirname(os.path.abspath(__file__))
         icon_path = os.path.join(script_dir, 'microphone.png')
@@ -139,6 +149,17 @@ class WhisperGUI(QMainWindow):
 
         main_layout.addWidget(control_panel)
 
+        engine_panel = QWidget()
+        engine_layout = QHBoxLayout(engine_panel)
+        engine_layout.setContentsMargins(0, 0, 0, 0)
+        engine_layout.addWidget(QLabel('Распознавание:'))
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem('Groq Whisper (облако)', GROQ_ENGINE)
+        self.engine_combo.addItem('GigaAM v3 (локально, GPU)', GIGAAM_ENGINE)
+        self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
+        engine_layout.addWidget(self.engine_combo)
+        main_layout.addWidget(engine_panel)
+
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
         self.text_edit.setFont(QFont('Segoe UI', 10))
@@ -153,7 +174,7 @@ class WhisperGUI(QMainWindow):
         info_layout.addWidget(self.info_label)
         info_layout.addStretch()
 
-        shortcut_label = QLabel(f'{TOGGLE_HOTKEY_LABEL} - запись, End - выход')
+        shortcut_label = QLabel(f'{TOGGLE_HOTKEY_LABEL} — запись, End — выход')
         shortcut_label.setStyleSheet('color: #888888; font-size: 11px;')
         info_layout.addWidget(shortcut_label)
 
@@ -166,6 +187,8 @@ class WhisperGUI(QMainWindow):
         self.pressed_keys = set()
         self.toggle_hotkey_active = False
         self.groq_client = Groq(api_key=GROQ_API_KEY, timeout=90.0) if GROQ_API_KEY else None
+        self.gigaam_model = None
+        self.gigaam_load_lock = threading.Lock()
 
         self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
@@ -181,8 +204,7 @@ class WhisperGUI(QMainWindow):
 
         self.stream = None
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.audio_storage_dir = os.path.join(script_dir, "temp_audio")
+        self.audio_storage_dir = os.path.join(get_app_dir(), "temp_audio")
         try:
             os.makedirs(self.audio_storage_dir, exist_ok=True)
             print(f"Using audio storage directory: {self.audio_storage_dir}")
@@ -225,18 +247,42 @@ class WhisperGUI(QMainWindow):
             print(f"Error in on_release handler: {e}")
 
     def is_toggle_hotkey_pressed(self):
-        ctrl_keys = {keyboard.Key.ctrl_l, keyboard.Key.ctrl_r, getattr(keyboard.Key, "ctrl", keyboard.Key.ctrl_l)}
-        alt_keys = {
-            keyboard.Key.alt_l,
-            keyboard.Key.alt_r,
-            getattr(keyboard.Key, "alt", keyboard.Key.alt_l),
-            getattr(keyboard.Key, "alt_gr", keyboard.Key.alt_r),
-        }
-        return (
-            keyboard.Key.space in self.pressed_keys
-            and bool(ctrl_keys & self.pressed_keys)
-            and bool(alt_keys & self.pressed_keys)
-        )
+        return keyboard.Key.ctrl_r in self.pressed_keys
+
+    def selected_engine(self):
+        return self.engine_combo.currentData()
+
+    def on_engine_changed(self, _index=None):
+        if self.selected_engine() != GIGAAM_ENGINE:
+            self.info_label.setText("Groq Whisper выбран")
+            return
+
+        try:
+            device_name = self.require_cuda()
+            self.info_label.setText(f"GigaAM будет работать на GPU: {device_name}")
+        except RuntimeError as e:
+            self.engine_combo.blockSignals(True)
+            self.engine_combo.setCurrentIndex(0)
+            self.engine_combo.blockSignals(False)
+            self.signal_update_error.emit(str(e))
+
+    def require_cuda(self):
+        """Return the CUDA device name, rejecting any CPU fallback."""
+        try:
+            import torch
+        except ImportError as e:
+            raise RuntimeError(
+                "Локальный режим требует CUDA-версию PyTorch. "
+                "Установите зависимости из README."
+            ) from e
+
+        if not torch.cuda.is_available():
+            build = torch.version.cuda or "CPU-only"
+            raise RuntimeError(
+                "GigaAM не запущен: CUDA недоступна "
+                f"(сборка PyTorch: {build}). Локальное распознавание на CPU запрещено."
+            )
+        return torch.cuda.get_device_name(torch.cuda.current_device())
 
     @pyqtSlot() 
     def toggle_recording(self):
@@ -262,7 +308,8 @@ class WhisperGUI(QMainWindow):
             audio_data_to_process = b''.join(self.audio_buffer)
             self.audio_buffer = [] 
             if audio_data_to_process:
-                 processing_thread = threading.Thread(target=self.process_audio_buffer, args=(audio_data_to_process,), daemon=True)
+                 engine = self.selected_engine()
+                 processing_thread = threading.Thread(target=self.process_audio_buffer, args=(audio_data_to_process, engine), daemon=True)
                  processing_thread.start()
             else:
                  print("No audio data captured, skipping processing.")
@@ -379,7 +426,7 @@ class WhisperGUI(QMainWindow):
         except Exception as e:
             print(f"Error managing stored audio files in {directory}: {e}")
 
-    def process_audio_buffer(self, audio_data_to_process):
+    def process_audio_buffer(self, audio_data_to_process, engine):
         if not audio_data_to_process:
             print("process_audio_buffer called with empty data.")
             self.signal_update_info.emit("Нет данных для обработки")
@@ -435,8 +482,10 @@ class WhisperGUI(QMainWindow):
             else:
                  raise subprocess.CalledProcessError(process.returncode, ffmpeg_command, output=process.stdout, stderr=process.stderr)
 
-            # Передаем созданный MP3 файл в функцию транскрипции
-            self.send_for_transcription(mp3_to_store_and_send) # <--- Имя файла MP3
+            if engine == GIGAAM_ENGINE:
+                self.send_for_gigaam_transcription(wav_filename)
+            else:
+                self.send_for_groq_transcription(mp3_to_store_and_send)
 
         except FileNotFoundError:
              error_message = "Ошибка: ffmpeg не найден. Установите ffmpeg и добавьте его в PATH."
@@ -458,8 +507,7 @@ class WhisperGUI(QMainWindow):
             except OSError as e_rem:
                 print(f"Warning: Could not remove temp WAV file {os.path.basename(wav_filename)}: {e_rem}")
     
-    # --- Эта функция приведена к виду, максимально близкому к вашему исходному ---
-    def send_for_transcription(self, audio_filename): # Используем audio_filename как имя параметра
+    def send_for_groq_transcription(self, audio_filename):
         """Отправляет аудиофайл в API и обрабатывает ответ."""
         if not os.path.exists(audio_filename):
              print(f"Audio file not found for transcription: {audio_filename}")
@@ -514,6 +562,95 @@ class WhisperGUI(QMainWindow):
             error_message = f"Неожиданная ошибка при обработке ответа API: {str(e)}"
             print(error_message)
             self.signal_update_error.emit(error_message)
+
+    def get_gigaam_model(self):
+        """Load GigaAM once. The package downloads missing weights into model_cache."""
+        with self.gigaam_load_lock:
+            if self.gigaam_model is not None:
+                return self.gigaam_model
+
+            device_name = self.require_cuda()
+            self.signal_update_info.emit(f"Загрузка GigaAM на GPU: {device_name}...")
+            try:
+                import gigaam
+            except ImportError as e:
+                raise RuntimeError(
+                    "Пакет GigaAM не установлен. Установите зависимости из README."
+                ) from e
+
+            model_cache = os.path.join(get_app_dir(), "model_cache", "gigaam")
+            self.gigaam_model = gigaam.load_model(
+                GIGAAM_MODEL,
+                device="cuda",
+                fp16_encoder=True,
+                download_root=model_cache,
+            )
+            model_device = next(self.gigaam_model.parameters()).device
+            if model_device.type != "cuda":
+                self.gigaam_model = None
+                raise RuntimeError("GigaAM загрузился не на GPU. Распознавание отменено.")
+            print(f"GigaAM loaded on {model_device}: {device_name}")
+            return self.gigaam_model
+
+    def send_for_gigaam_transcription(self, wav_filename):
+        if not os.path.exists(wav_filename):
+            self.signal_update_error.emit("Файл аудио не найден для GigaAM")
+            return
+
+        try:
+            model = self.get_gigaam_model()
+            self.signal_update_info.emit("GigaAM распознаёт речь на GPU...")
+            transcription_started_at = time.perf_counter()
+            transcribed_text = self.transcribe_with_gigaam(model, wav_filename)
+            transcription_elapsed = time.perf_counter() - transcription_started_at
+            print(f"GigaAM transcription completed in {transcription_elapsed:.2f}s")
+
+            if transcribed_text:
+                self.update_transcript.emit(transcribed_text)
+                self.signal_simulate_typing.emit(transcribed_text + " ")
+            else:
+                self.signal_update_info.emit("Распознан пустой текст (тишина?)")
+        except Exception as e:
+            error_message = f"Ошибка GigaAM: {str(e)}"
+            print(error_message)
+            self.signal_update_error.emit(error_message)
+
+    def transcribe_with_gigaam(self, model, wav_filename):
+        """Split long recordings because GigaAM's short-form API accepts up to 25 seconds."""
+        with wave.open(wav_filename, "rb") as source_wav:
+            max_frames = source_wav.getframerate() * GIGAAM_MAX_SEGMENT_SECONDS
+            if source_wav.getnframes() <= max_frames:
+                result = model.transcribe(wav_filename)
+                return (getattr(result, "text", "") or "").strip()
+
+            self.signal_update_info.emit("Длинная запись: GigaAM обрабатывает фрагменты на GPU...")
+            params = source_wav.getparams()
+            chunk_texts = []
+            while True:
+                frames = source_wav.readframes(max_frames)
+                if not frames:
+                    break
+
+                chunk_filename = os.path.join(
+                    os.path.dirname(wav_filename),
+                    f"gigaam_chunk_{uuid.uuid4()}.wav",
+                )
+                try:
+                    with wave.open(chunk_filename, "wb") as chunk_wav:
+                        chunk_wav.setparams(params)
+                        chunk_wav.writeframes(frames)
+                    result = model.transcribe(chunk_filename)
+                    text = (getattr(result, "text", "") or "").strip()
+                    if text:
+                        chunk_texts.append(text)
+                finally:
+                    try:
+                        if os.path.exists(chunk_filename):
+                            os.remove(chunk_filename)
+                    except OSError as e:
+                        print(f"Warning: Could not remove GigaAM chunk {chunk_filename}: {e}")
+
+            return " ".join(chunk_texts)
 
     @pyqtSlot(str) 
     def simulate_typing_slot(self, text):
