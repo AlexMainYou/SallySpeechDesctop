@@ -26,6 +26,11 @@ def get_app_dir():
         else os.path.dirname(os.path.abspath(__file__))
     )
 
+def get_gigaam_cache_dir():
+    # GigaAM's tokenizer loader does not reliably support non-ASCII paths on Windows.
+    cache_base = os.environ.get("LOCALAPPDATA") or get_app_dir()
+    return os.path.join(cache_base, "SallySpeech", "model_cache", "gigaam")
+
 def load_env_value(name, default=None):
     env_path = os.path.join(get_app_dir(), ".env")
     try:
@@ -578,7 +583,7 @@ class WhisperGUI(QMainWindow):
                     "Пакет GigaAM не установлен. Установите зависимости из README."
                 ) from e
 
-            model_cache = os.path.join(get_app_dir(), "model_cache", "gigaam")
+            model_cache = get_gigaam_cache_dir()
             self.gigaam_model = gigaam.load_model(
                 GIGAAM_MODEL,
                 device="cuda",

@@ -46,10 +46,10 @@ GROQ_API_KEY=your_groq_api_key_here
 ```
 
 GigaAM does not require an API key. When **GigaAM v3 (local, GPU)** is selected,
-the app checks that CUDA is available, downloads the model to `model_cache/gigaam/`
-next to the application when needed, and loads it explicitly on `cuda`. It never
-falls back to CPU: if CUDA PyTorch or an NVIDIA GPU is unavailable, the app returns
-to Groq mode and shows an error.
+the app checks that CUDA is available, downloads the model to
+`%LOCALAPPDATA%\SallySpeech\model_cache\gigaam\` when needed, and loads it
+explicitly on `cuda`. It never falls back to CPU: if CUDA PyTorch or an NVIDIA GPU
+is unavailable, the app returns to Groq mode and shows an error.
 
 ## Build EXE
 
