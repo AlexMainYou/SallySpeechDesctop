@@ -1,6 +1,7 @@
 import ctypes
 from ctypes import wintypes
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -20,9 +21,9 @@ import numpy as np
 import pyaudio
 from groq import APIConnectionError, APIStatusError, APITimeoutError, Groq
 from pynput import keyboard
-from PyQt6.QtCore import QEasingCurve, QMetaObject, QPoint, QPropertyAnimation, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QMetaObject, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen
-from PyQt6.QtWidgets import QApplication, QComboBox, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QComboBox, QFileDialog, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget
 
 
 def get_app_dir():
@@ -104,6 +105,58 @@ class RecordButton(QPushButton):
             painter.drawLine(18, 35, 28, 35)
 
 
+class MediaButton(QPushButton):
+    """Small document button that does not depend on a font glyph."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(28, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Открыть расшифровку файла")
+        self.setStyleSheet("QPushButton { border: 0; background: #252A3A; border-radius: 8px; } QPushButton:hover { background: #38405A; }")
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#DDE4F7"), 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(8, 5, 12, 17, 2, 2)
+        painter.drawLine(16, 5, 20, 9)
+        painter.drawLine(16, 5, 16, 9)
+        painter.drawLine(16, 9, 20, 9)
+        painter.drawLine(11, 13, 17, 13)
+        painter.drawLine(11, 17, 17, 17)
+
+
+class DropArea(QLabel):
+    file_dropped = pyqtSignal(str)
+    choose_requested = pyqtSignal()
+
+    def __init__(self):
+        super().__init__("Перетащите сюда\nаудио или видео\n\nили нажмите для выбора")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setAcceptDrops(True)
+        self.setMinimumWidth(180)
+        self.setStyleSheet("""
+            QLabel { color: #9CA9C7; background: #202536; border: 1px dashed #5C6684; border-radius: 18px; font-size: 12px; }
+            QLabel:hover { background: #262D42; border-color: #8B5CF6; color: #DDE4F7; }
+        """)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls() and len(event.mimeData().urls()) == 1 and event.mimeData().urls()[0].isLocalFile():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        self.file_dropped.emit(event.mimeData().urls()[0].toLocalFile())
+        event.acceptProposedAction()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.choose_requested.emit()
+        super().mousePressEvent(event)
+
+
 class Waveform(QWidget):
     """A small, animated input-level visualizer for the overlay."""
 
@@ -158,6 +211,7 @@ class SallySpeechV6(QMainWindow):
     update_preview = pyqtSignal(str)
     update_wave = pyqtSignal(float)
     request_paste = pyqtSignal(str)
+    update_transcript = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -172,6 +226,8 @@ class SallySpeechV6(QMainWindow):
         self.gigaam_model = None
         self.gigaam_load_lock = threading.Lock()
         self.gigaam_inference_lock = threading.Lock()
+        self.media_running = False
+        self.media_expanded = False
         self.groq_client = Groq(api_key=GROQ_API_KEY, timeout=90.0) if GROQ_API_KEY else None
 
         self.init_ui()
@@ -179,6 +235,7 @@ class SallySpeechV6(QMainWindow):
         self.update_preview.connect(self.set_preview)
         self.update_wave.connect(self.waveform.set_level)
         self.request_paste.connect(self.paste_phrase)
+        self.update_transcript.connect(self.set_transcript)
         self.target_timer = QTimer(self)
         self.target_timer.timeout.connect(self.remember_target_window)
         self.target_timer.start(150)
@@ -206,7 +263,7 @@ class SallySpeechV6(QMainWindow):
         root = QWidget(canvas)
         root.setObjectName("root")
         root.setStyleSheet("""
-            #root { background: #171923; border: 1px solid #363B52; border-radius: 25px; }
+            #root { background: #171923; border: 1px solid #363B52; border-radius: 33px; }
             QLabel { color: #E9ECF5; }
             QComboBox { background: #252A3A; color: #C9D1E8; border: 0; border-radius: 8px; padding: 4px 8px; font-size: 10px; }
             QComboBox::drop-down { border: 0; width: 14px; }
@@ -245,6 +302,10 @@ class SallySpeechV6(QMainWindow):
         self.engine_combo.currentIndexChanged.connect(self.engine_changed)
         top.addWidget(self.engine_combo)
 
+        self.media_button = MediaButton()
+        self.media_button.clicked.connect(self.toggle_media_panel)
+        top.addWidget(self.media_button)
+
         self.close_button = QPushButton("×")
         self.close_button.setAccessibleName("Закрыть Sally Speech")
         self.close_button.setToolTip("Закрыть программу")
@@ -260,6 +321,38 @@ class SallySpeechV6(QMainWindow):
 
         self.waveform = Waveform()
         layout.addWidget(self.waveform)
+
+        self.media_panel = QWidget()
+        media_layout = QHBoxLayout(self.media_panel)
+        media_layout.setContentsMargins(0, 10, 0, 0)
+        media_layout.setSpacing(10)
+        self.drop_area = DropArea()
+        self.drop_area.file_dropped.connect(self.start_media_transcription)
+        self.drop_area.choose_requested.connect(self.choose_media_file)
+        media_layout.addWidget(self.drop_area, 4)
+
+        transcript_column = QVBoxLayout()
+        self.transcript_edit = QTextEdit()
+        self.transcript_edit.setReadOnly(True)
+        self.transcript_edit.setPlaceholderText("Здесь появится последняя расшифровка")
+        self.transcript_edit.setStyleSheet("""
+            QTextEdit { color: #E9ECF5; background: #202536; border: 1px solid #363B52; border-radius: 18px; padding: 8px; font-size: 11px; }
+        """)
+        transcript_column.addWidget(self.transcript_edit, 1)
+        transcript_actions = QHBoxLayout()
+        self.copy_button = QPushButton("Копировать")
+        self.copy_button.clicked.connect(self.copy_transcript)
+        self.save_button = QPushButton("Сохранить…")
+        self.save_button.clicked.connect(self.save_transcript)
+        for button in (self.copy_button, self.save_button):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet("QPushButton { color: #DDE4F7; background: #2A3147; border: 0; border-radius: 9px; padding: 6px 10px; font-size: 11px; } QPushButton:hover { background: #3A4666; }")
+            transcript_actions.addWidget(button)
+        transcript_actions.addStretch()
+        transcript_column.addLayout(transcript_actions)
+        media_layout.addLayout(transcript_column, 5)
+        self.media_panel.setVisible(False)
+        layout.addWidget(self.media_panel, 1)
 
     def setup_audio(self):
         try:
@@ -298,6 +391,100 @@ class SallySpeechV6(QMainWindow):
         else:
             self.update_status.emit("Groq · вставка после окончания записи")
 
+    @pyqtSlot()
+    def toggle_media_panel(self):
+        self.media_expanded = not self.media_expanded
+        self.media_panel.setVisible(self.media_expanded)
+        self.setFixedSize(478, 478 if self.media_expanded else 154)
+        self.media_button.setToolTip("Скрыть расшифровку файла" if self.media_expanded else "Открыть расшифровку файла")
+
+    @pyqtSlot()
+    def choose_media_file(self):
+        source, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите аудио или видео",
+            "",
+            "Медиафайлы (*.mp3 *.wav *.m4a *.aac *.ogg *.flac *.opus *.mp4 *.mkv *.avi *.mov *.webm *.3gp);;Все файлы (*)",
+        )
+        if source:
+            self.start_media_transcription(source)
+
+    @pyqtSlot(str)
+    def start_media_transcription(self, source):
+        if self.media_running:
+            self.update_status.emit("Предыдущий файл ещё распознаётся")
+            return
+        if not os.path.isfile(source):
+            self.update_status.emit("Файл не найден")
+            return
+        self.media_running = True
+        self.drop_area.setText(f"Обрабатываю\n{os.path.basename(source)}")
+        self.update_transcript.emit("")
+        threading.Thread(target=self.transcribe_media, args=(source,), daemon=True).start()
+
+    def find_ffmpeg(self):
+        bundled = os.path.join(get_app_dir(), "ffmpeg.exe")
+        return bundled if os.path.isfile(bundled) else shutil.which("ffmpeg")
+
+    def convert_media_to_wav(self, source):
+        ffmpeg = self.find_ffmpeg()
+        if not ffmpeg:
+            raise RuntimeError("FFmpeg не найден. Добавьте ffmpeg.exe в PATH или рядом с программой.")
+        output = os.path.join(get_app_dir(), "temp_audio", f"sv6_media_{uuid.uuid4()}.wav")
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        result = subprocess.run(
+            [ffmpeg, "-y", "-i", source, "-vn", "-ac", "1", "-ar", str(RATE), "-c:a", "pcm_s16le", output],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0 or not os.path.exists(output):
+            details = result.stderr.decode(errors="replace").strip().splitlines()
+            raise RuntimeError(details[-1] if details else "FFmpeg не смог прочитать этот файл")
+        return output
+
+    def transcribe_media(self, source):
+        wav_file = None
+        try:
+            self.update_status.emit("Подготавливаю аудио через FFmpeg…")
+            wav_file = self.convert_media_to_wav(source)
+            self.update_status.emit("Загружаю GigaAM GPU…")
+            with self.gigaam_inference_lock:
+                text = self.transcribe_gigaam_file(self.get_gigaam_model(), wav_file, "Распознаю файл")
+            self.update_transcript.emit(text or "В файле не удалось найти речь.")
+            self.update_status.emit("Файл распознан · текст можно скопировать или сохранить")
+        except Exception as e:
+            self.update_transcript.emit(f"Ошибка: {e}")
+            self.update_status.emit("Не удалось распознать файл")
+        finally:
+            if wav_file and os.path.exists(wav_file):
+                os.remove(wav_file)
+            self.media_running = False
+            self.drop_area.setText("Перетащите сюда\nаудио или видео\n\nили нажмите для выбора")
+
+    @pyqtSlot(str)
+    def set_transcript(self, text):
+        self.transcript_edit.setPlainText(text)
+
+    @pyqtSlot()
+    def copy_transcript(self):
+        text = self.transcript_edit.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.update_status.emit("Текст скопирован")
+
+    @pyqtSlot()
+    def save_transcript(self):
+        text = self.transcript_edit.toPlainText()
+        if not text:
+            return
+        filename, _ = QFileDialog.getSaveFileName(self, "Сохранить расшифровку", "transcript.txt", "Текстовый файл (*.txt)")
+        if filename:
+            if not filename.lower().endswith(".txt"):
+                filename += ".txt"
+            with open(filename, "w", encoding="utf-8") as output:
+                output.write(text)
+            self.update_status.emit("Текст сохранён")
+
     def require_cuda(self):
         if torch is None:
             raise RuntimeError(f"CUDA PyTorch недоступен: {TORCH_IMPORT_ERROR}")
@@ -333,6 +520,7 @@ class SallySpeechV6(QMainWindow):
         self.record_button.set_recording(True)
         self.update_status.emit("Слушаю…")
         self.update_preview.emit("Говорите — текст вставится после остановки")
+        self.update_transcript.emit("")
 
     def stop_recording(self):
         self.is_recording = False
@@ -389,18 +577,23 @@ class SallySpeechV6(QMainWindow):
                     raise RuntimeError("GigaAM не загрузился на GPU")
             return self.gigaam_model
 
-    def transcribe_gigaam_file(self, model, wav_file):
+    def transcribe_gigaam_file(self, model, wav_file, task_name="Распознаю запись"):
         """The upstream short-form GigaAM API accepts at most 25 seconds per call."""
         with wave.open(wav_file, "rb") as source:
             max_frames = source.getframerate() * 24
             if source.getnframes() <= max_frames:
+                self.update_status.emit(task_name + "…")
                 return (model.transcribe(wav_file).text or "").strip()
             params = source.getparams()
+            total_parts = (source.getnframes() + max_frames - 1) // max_frames
             texts = []
+            part_number = 0
             while True:
                 frames = source.readframes(max_frames)
                 if not frames:
                     break
+                part_number += 1
+                self.update_status.emit(f"{task_name}: фрагмент {part_number}/{total_parts}")
                 part = os.path.join(os.path.dirname(wav_file), f"sv6_part_{uuid.uuid4()}.wav")
                 try:
                     with wave.open(part, "wb") as target:
@@ -422,12 +615,14 @@ class SallySpeechV6(QMainWindow):
                 with self.gigaam_inference_lock:
                     text = self.transcribe_gigaam_file(self.get_gigaam_model(), wav_file)
                 self.update_preview.emit(text or "Тишина")
+                self.update_transcript.emit(text or "")
                 if text:
                     self.request_paste.emit(text + " ")
             else:
                 text = self.transcribe_groq(wav_file)
                 if text:
                     self.update_preview.emit(text)
+                    self.update_transcript.emit(text)
                     self.request_paste.emit(text + " ")
             self.update_status.emit("Готово · Правый Ctrl или кнопка")
         except Exception as e:
