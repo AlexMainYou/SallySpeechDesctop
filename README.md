@@ -11,7 +11,7 @@ The app supports Groq Whisper (`whisper-large-v3`) and local GigaAM v3 recogniti
 - Groq Whisper transcription
 - Local GigaAM v3 e2e RNNT transcription on CUDA; the model is downloaded automatically on first use
 - Engine selector: Groq Whisper or GigaAM v3 (local GPU)
-- Direct Unicode text insertion without overwriting the clipboard
+- Reliable whole-phrase insertion through a temporary clipboard paste; the previous text is restored
 - Local transcript window with manual copy button
 - Short-lived audio files stored in `temp_audio/`
 - Packaged Windows executable available in GitHub Releases

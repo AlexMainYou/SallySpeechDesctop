@@ -114,6 +114,7 @@ class WhisperGUI(QMainWindow):
     signal_update_error = pyqtSignal(str)
     signal_update_info = pyqtSignal(str)
     signal_simulate_typing = pyqtSignal(str)
+    signal_paste_text = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -121,6 +122,7 @@ class WhisperGUI(QMainWindow):
         self.signal_update_error.connect(self.update_transcript_error)
         self.signal_update_info.connect(self.update_info_label)
         self.signal_simulate_typing.connect(self.simulate_typing_slot)
+        self.signal_paste_text.connect(self.paste_text)
 
         self.initUI()
         self.setup_audio()
@@ -666,23 +668,35 @@ class WhisperGUI(QMainWindow):
 
     @pyqtSlot(str) 
     def simulate_typing_slot(self, text):
-         threading.Thread(target=self._insert_text_worker, args=(text,), daemon=True).start()
+        self.signal_paste_text.emit(text)
 
-    def _insert_text_worker(self, text):
-        print(f"Inserting transcription with Unicode input: '{text[:50]}...'")
+    @pyqtSlot(str)
+    def paste_text(self, text):
+        """Paste a whole phrase atomically instead of emitting thousands of key events."""
+        if os.name != "nt":
+            self.signal_update_error.emit("Вставка текста поддерживается только в Windows.")
+            return
+
+        clipboard = QApplication.clipboard()
+        previous_text = clipboard.text()
+        clipboard.setText(text)
         try:
-            time.sleep(0.05)
-            self._send_unicode_text(text)
+            self._send_ctrl_v()
         except Exception as e:
-            print(f"Error during Unicode text insertion: {e}")
+            self.signal_update_error.emit(f"Ошибка вставки текста: {e}")
+            return
 
-    def _send_unicode_text(self, text):
-        if os.name != 'nt':
-            raise RuntimeError("Unicode text insertion without clipboard is only implemented on Windows.")
+        # Restore the clipboard after the target application has handled Ctrl+V.
+        QTimer.singleShot(300, lambda: self.restore_clipboard(previous_text, text))
 
+    def restore_clipboard(self, previous_text, pasted_text):
+        clipboard = QApplication.clipboard()
+        if clipboard.text() == pasted_text:
+            clipboard.setText(previous_text)
+
+    def _send_ctrl_v(self):
         input_keyboard = 1
         keyeventf_keyup = 0x0002
-        keyeventf_unicode = 0x0004
         user32 = ctypes.WinDLL("user32", use_last_error=True)
 
         class KEYBDINPUT(ctypes.Structure):
@@ -725,35 +739,28 @@ class WhisperGUI(QMainWindow):
         user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
         user32.SendInput.restype = wintypes.UINT
 
-        def make_input(code_unit, key_up=False):
-            flags = keyeventf_unicode | (keyeventf_keyup if key_up else 0)
+        def make_input(virtual_key, key_up=False):
+            flags = keyeventf_keyup if key_up else 0
             return INPUT(
                 type=input_keyboard,
                 ki=KEYBDINPUT(
-                    wVk=0,
-                    wScan=code_unit,
+                    wVk=virtual_key,
+                    wScan=0,
                     dwFlags=flags,
                     time=0,
                     dwExtraInfo=0,
                 ),
             )
 
-        utf16 = text.encode("utf-16-le")
-        code_units = [
-            int.from_bytes(utf16[i:i + 2], "little")
-            for i in range(0, len(utf16), 2)
-        ]
-
-        for start in range(0, len(code_units), 64):
-            events = []
-            for code_unit in code_units[start:start + 64]:
-                events.append(make_input(code_unit))
-                events.append(make_input(code_unit, key_up=True))
-
-            inputs = (INPUT * len(events))(*events)
-            sent = user32.SendInput(len(events), inputs, ctypes.sizeof(INPUT))
-            if sent != len(events):
-                raise ctypes.WinError(ctypes.get_last_error())
+        inputs = (INPUT * 4)(
+            make_input(0x11),  # VK_CONTROL down
+            make_input(0x56),  # V down
+            make_input(0x56, key_up=True),
+            make_input(0x11, key_up=True),
+        )
+        sent = user32.SendInput(len(inputs), inputs, ctypes.sizeof(INPUT))
+        if sent != len(inputs):
+            raise ctypes.WinError(ctypes.get_last_error())
 
     @pyqtSlot(str) 
     def update_transcript_text(self, text):
