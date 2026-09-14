@@ -85,24 +85,24 @@ class RecordButton(QPushButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         color = QColor("#F0526D") if self.recording else QColor("#7C5CFC")
+        diameter = 38
         if self.recording:
-            pulse = 2 + int((np.sin(self.phase) + 1) * 1.5)
-            painter.setBrush(QColor(240, 82, 109, 55))
-            painter.drawEllipse(pulse // 2, pulse // 2, 46 - pulse, 46 - pulse)
+            diameter += int((np.sin(self.phase) + 1) * 2)
+        offset = (46 - diameter) // 2
         painter.setBrush(color)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(4, 4, 38, 38)
+        painter.drawEllipse(offset, offset, diameter, diameter)
         painter.setPen(QPen(QColor("white"), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         if self.recording:
             painter.setBrush(QColor("white"))
             painter.drawRoundedRect(17, 17, 12, 12, 2, 2)
         else:
             painter.setBrush(QColor("white"))
-            painter.drawRoundedRect(18, 11, 10, 17, 5, 5)
+            painter.drawRoundedRect(17, 9, 12, 19, 6, 6)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawArc(13, 17, 20, 18, 180 * 16, 180 * 16)
-            painter.drawLine(23, 34, 23, 30)
-            painter.drawLine(18, 35, 28, 35)
+            painter.drawArc(13, 16, 20, 19, 180 * 16, 180 * 16)
+            painter.drawLine(23, 35, 23, 31)
+            painter.drawLine(18, 36, 28, 36)
 
 
 class MediaButton(QPushButton):
@@ -337,6 +337,11 @@ class SallySpeechV6(QMainWindow):
         self.transcript_edit.setPlaceholderText("Здесь появится последняя расшифровка")
         self.transcript_edit.setStyleSheet("""
             QTextEdit { color: #E9ECF5; background: #202536; border: 1px solid #363B52; border-radius: 18px; padding: 8px; font-size: 11px; }
+            QScrollBar:vertical { background: transparent; width: 10px; margin: 10px 3px 10px 0; }
+            QScrollBar::handle:vertical { background: #697493; min-height: 34px; border-radius: 5px; }
+            QScrollBar::handle:vertical:hover { background: #8B98BC; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
         """)
         transcript_column.addWidget(self.transcript_edit, 1)
         transcript_actions = QHBoxLayout()
@@ -347,8 +352,7 @@ class SallySpeechV6(QMainWindow):
         for button in (self.copy_button, self.save_button):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setStyleSheet("QPushButton { color: #DDE4F7; background: #2A3147; border: 0; border-radius: 9px; padding: 6px 10px; font-size: 11px; } QPushButton:hover { background: #3A4666; }")
-            transcript_actions.addWidget(button)
-        transcript_actions.addStretch()
+            transcript_actions.addWidget(button, 1)
         transcript_column.addLayout(transcript_actions)
         media_layout.addLayout(transcript_column, 5)
         self.media_panel.setVisible(False)
@@ -519,7 +523,7 @@ class SallySpeechV6(QMainWindow):
         self.waveform.set_recording(True)
         self.record_button.set_recording(True)
         self.update_status.emit("Слушаю…")
-        self.update_preview.emit("Говорите — текст вставится после остановки")
+        self.update_preview.emit("Текст будет после остановки")
         self.update_transcript.emit("")
 
     def stop_recording(self):
@@ -640,7 +644,8 @@ class SallySpeechV6(QMainWindow):
 
     @pyqtSlot(str)
     def set_preview(self, text):
-        self.preview_label.setText(text[-95:])
+        words = text.split()
+        self.preview_label.setText(" ".join(words[-4:]))
 
     @pyqtSlot(str)
     def paste_phrase(self, text):
