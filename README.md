@@ -55,7 +55,7 @@ is unavailable, the app returns to Groq mode and shows an error.
 
 ```powershell
 python -m pip install pyinstaller
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name SV5 --icon ".\assets\ico.ico" --collect-all gigaam --collect-all hydra --collect-all omegaconf --collect-all torch --collect-all torchaudio .\SV5.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name SV5 --icon ".\assets\ico.ico" --collect-all gigaam .\SV5.py
 ```
 
 The executable will be created at `dist\SV5.exe`.
