@@ -1,4 +1,13 @@
 import sys
+try:
+    # PyQt6 loads DLLs that conflict with CUDA PyTorch on some Windows systems.
+    # Loading PyTorch first keeps its CUDA dependencies in the process search path.
+    import torch
+    TORCH_IMPORT_ERROR = None
+except (ImportError, OSError) as e:
+    torch = None
+    TORCH_IMPORT_ERROR = e
+
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
@@ -273,13 +282,11 @@ class WhisperGUI(QMainWindow):
 
     def require_cuda(self):
         """Return the CUDA device name, rejecting any CPU fallback."""
-        try:
-            import torch
-        except ImportError as e:
+        if torch is None:
             raise RuntimeError(
                 "Локальный режим требует CUDA-версию PyTorch. "
-                "Установите зависимости из README."
-            ) from e
+                f"Установите зависимости из README. Причина: {TORCH_IMPORT_ERROR}"
+            )
 
         if not torch.cuda.is_available():
             build = torch.version.cuda or "CPU-only"
