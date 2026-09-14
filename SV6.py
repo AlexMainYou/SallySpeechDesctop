@@ -129,11 +129,11 @@ class SallySpeechV6(QMainWindow):
         self.gigaam_inference_lock = threading.Lock()
         self.groq_client = Groq(api_key=GROQ_API_KEY, timeout=90.0) if GROQ_API_KEY else None
 
+        self.init_ui()
         self.update_status.connect(self.status_label.setText)
         self.update_preview.connect(self.set_preview)
         self.update_wave.connect(self.waveform.set_level)
         self.request_paste.connect(self.paste_phrase)
-        self.init_ui()
         self.setup_audio()
 
     def init_ui(self):
