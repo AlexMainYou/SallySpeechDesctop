@@ -1,7 +1,6 @@
 import ctypes
 from ctypes import wintypes
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -57,10 +56,6 @@ GIGAAM_MODEL = "v3_e2e_rnnt"
 RATE = 44100
 CHANNELS = 1
 CHUNK = 1024
-LIVE_CHUNK_SECONDS = 2.6
-LIVE_STABLE_WORDS = 2
-
-
 class RecordButton(QPushButton):
     """Round microphone button drawn as a real icon instead of a text glyph."""
 
@@ -71,28 +66,42 @@ class RecordButton(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Начать или остановить запись")
         self.setStyleSheet("QPushButton { border: 0; background: transparent; }")
+        self.phase = 0.0
+        self.animation_timer = QTimer(self)
+        self.animation_timer.timeout.connect(self.animate)
+        self.animation_timer.start(6)
 
     def set_recording(self, recording):
         self.recording = recording
         self.update()
 
+    def animate(self):
+        if self.recording:
+            self.phase += 0.045
+            self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         color = QColor("#F0526D") if self.recording else QColor("#7C5CFC")
+        if self.recording:
+            pulse = 2 + int((np.sin(self.phase) + 1) * 1.5)
+            painter.setBrush(QColor(240, 82, 109, 55))
+            painter.drawEllipse(pulse // 2, pulse // 2, 46 - pulse, 46 - pulse)
         painter.setBrush(color)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(2, 2, 42, 42)
+        painter.drawEllipse(4, 4, 38, 38)
         painter.setPen(QPen(QColor("white"), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         if self.recording:
             painter.setBrush(QColor("white"))
             painter.drawRoundedRect(17, 17, 12, 12, 2, 2)
         else:
+            painter.setBrush(QColor("white"))
+            painter.drawRoundedRect(18, 11, 10, 17, 5, 5)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(18, 11, 10, 18, 5, 5)
-            painter.drawArc(13, 17, 20, 19, 0, -180 * 16)
-            painter.drawLine(23, 36, 23, 31)
-            painter.drawLine(17, 36, 29, 36)
+            painter.drawArc(13, 17, 20, 18, 180 * 16, 180 * 16)
+            painter.drawLine(23, 34, 23, 30)
+            painter.drawLine(18, 35, 28, 35)
 
 
 class Waveform(QWidget):
@@ -100,25 +109,28 @@ class Waveform(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.level = 0.0
+        self.target_level = 0.0
+        self.display_level = 0.0
         self.phase = 0.0
         self.recording = False
         self.setFixedHeight(34)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.animate)
-        self.timer.start(35)
+        self.timer.start(6)
 
     def set_recording(self, recording):
         self.recording = recording
         self.update()
 
     def set_level(self, level):
-        self.level = max(0.0, min(1.0, level))
+        self.target_level = max(0.0, min(1.0, level))
 
     def animate(self):
-        self.phase += 0.22
+        self.phase += 0.055
+        self.display_level += (self.target_level - self.display_level) * 0.13
         if not self.recording:
-            self.level *= 0.86
+            self.target_level = 0.0
+            self.display_level *= 0.92
         self.update()
 
     def paintEvent(self, event):
@@ -136,7 +148,7 @@ class Waveform(QWidget):
         for index in range(bars):
             ripple = (np.sin(self.phase + index * 0.63) + 1.0) / 2.0
             idle = 2 + ripple * 2
-            amplitude = idle + (self.level * (10 + 18 * ripple) if self.recording else 0)
+            amplitude = idle + (self.display_level * (10 + 18 * ripple) if self.recording else 0)
             x = index * (bar_width + gap)
             painter.drawRoundedRect(int(x), int((height - amplitude) / 2), bar_width, int(amplitude), 2, 2)
 
@@ -155,10 +167,6 @@ class SallySpeechV6(QMainWindow):
         self.hotkey_active = False
         self.stream = None
         self.audio_buffer = []
-        self.confirmed_words = []
-        self.last_hypothesis_words = []
-        self.live_busy = False
-        self.live_lock = threading.Lock()
         self.active_engine = GIGAAM_ENGINE
         self.target_window = 0
         self.gigaam_model = None
@@ -178,7 +186,8 @@ class SallySpeechV6(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("Sally Speech 6")
-        self.setFixedSize(446, 122)
+        # The transparent margin gives the drop shadow room to fade naturally.
+        self.setFixedSize(478, 154)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -188,11 +197,16 @@ class SallySpeechV6(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        root = QWidget()
-        self.setCentralWidget(root)
+        canvas = QWidget()
+        canvas.setStyleSheet("background: transparent;")
+        self.setCentralWidget(canvas)
+        canvas_layout = QVBoxLayout(canvas)
+        canvas_layout.setContentsMargins(16, 12, 16, 22)
+
+        root = QWidget(canvas)
         root.setObjectName("root")
         root.setStyleSheet("""
-            #root { background: #171923; border: 1px solid #363B52; border-radius: 18px; }
+            #root { background: #171923; border: 1px solid #363B52; border-radius: 25px; }
             QLabel { color: #E9ECF5; }
             QComboBox { background: #252A3A; color: #C9D1E8; border: 0; border-radius: 8px; padding: 4px 8px; font-size: 10px; }
             QComboBox::drop-down { border: 0; width: 14px; }
@@ -202,6 +216,7 @@ class SallySpeechV6(QMainWindow):
         shadow.setOffset(0, 8)
         shadow.setColor(QColor(0, 0, 0, 150))
         root.setGraphicsEffect(shadow)
+        canvas_layout.addWidget(root)
 
         layout = QVBoxLayout(root)
         layout.setContentsMargins(16, 12, 16, 10)
@@ -274,7 +289,7 @@ class SallySpeechV6(QMainWindow):
         if self.selected_engine() == GIGAAM_ENGINE:
             try:
                 self.require_cuda()
-                self.update_status.emit("GigaAM GPU · вставка во время речи")
+                self.update_status.emit("GigaAM GPU · вставка после записи")
             except RuntimeError as e:
                 self.engine_combo.blockSignals(True)
                 self.engine_combo.setCurrentIndex(1)
@@ -313,16 +328,11 @@ class SallySpeechV6(QMainWindow):
             return
         self.audio_buffer = []
         self.active_engine = self.selected_engine()
-        self.confirmed_words = []
-        self.last_hypothesis_words = []
-        with self.live_lock:
-            self.live_busy = False
-        self.next_live_at = time.monotonic() + LIVE_CHUNK_SECONDS
         self.is_recording = True
         self.waveform.set_recording(True)
         self.record_button.set_recording(True)
         self.update_status.emit("Слушаю…")
-        self.update_preview.emit("Говорите — фразы появятся в активном окне")
+        self.update_preview.emit("Говорите — текст вставится после остановки")
 
     def stop_recording(self):
         self.is_recording = False
@@ -353,25 +363,9 @@ class SallySpeechV6(QMainWindow):
                 rms = np.sqrt(np.mean(samples * samples))
                 level = min(1.0, max(0.04, (rms / 2600.0) ** 0.55))
                 self.update_wave.emit(float(level))
-                if self.active_engine == GIGAAM_ENGINE and time.monotonic() >= self.next_live_at:
-                    self.queue_live_snapshot()
-                    self.next_live_at += LIVE_CHUNK_SECONDS
             except Exception as e:
                 self.update_status.emit(f"Ошибка записи: {e}")
                 self.is_recording = False
-
-    def queue_live_snapshot(self):
-        """Transcribe accumulated speech, so a word is never split at a chunk edge."""
-        with self.live_lock:
-            if self.live_busy:
-                return
-            self.live_busy = True
-        snapshot = b"".join(self.audio_buffer)
-        if len(snapshot) < int(1.2 * RATE * CHANNELS * 2):
-            with self.live_lock:
-                self.live_busy = False
-            return
-        threading.Thread(target=self.transcribe_live_snapshot, args=(snapshot,), daemon=True).start()
 
     def write_wav(self, audio_data):
         os.makedirs(os.path.join(get_app_dir(), "temp_audio"), exist_ok=True)
@@ -394,24 +388,6 @@ class SallySpeechV6(QMainWindow):
                     self.gigaam_model = None
                     raise RuntimeError("GigaAM не загрузился на GPU")
             return self.gigaam_model
-
-    def transcribe_live_snapshot(self, audio_data):
-        wav_file = None
-        try:
-            wav_file = self.write_wav(audio_data)
-            with self.gigaam_inference_lock:
-                text = self.transcribe_gigaam_file(self.get_gigaam_model(), wav_file)
-            new_text = self.confirm_stable_words(text)
-            if new_text:
-                self.update_preview.emit(new_text)
-                self.request_paste.emit(new_text + " ")
-        except Exception as e:
-            self.update_status.emit(f"GigaAM: {e}")
-        finally:
-            if wav_file and os.path.exists(wav_file):
-                os.remove(wav_file)
-            with self.live_lock:
-                self.live_busy = False
 
     def transcribe_gigaam_file(self, model, wav_file):
         """The upstream short-form GigaAM API accepts at most 25 seconds per call."""
@@ -438,42 +414,6 @@ class SallySpeechV6(QMainWindow):
                         os.remove(part)
             return " ".join(texts)
 
-    @staticmethod
-    def normalized_words(words):
-        return [re.sub(r"[^\wа-яё-]", "", word.lower()) for word in words]
-
-    def confirm_stable_words(self, text):
-        words = text.split()
-        self.last_hypothesis_words = words
-        if len(words) <= LIVE_STABLE_WORDS:
-            return ""
-        stable_words = words[:-LIVE_STABLE_WORDS]
-        confirmed_normalized = self.normalized_words(self.confirmed_words)
-        stable_normalized = self.normalized_words(stable_words)
-        if stable_normalized[:len(confirmed_normalized)] != confirmed_normalized:
-            return ""
-        new_words = stable_words[len(self.confirmed_words):]
-        self.confirmed_words.extend(new_words)
-        return " ".join(new_words)
-
-    def final_new_words(self, text):
-        words = text.split()
-        if not words:
-            return ""
-        confirmed_normalized = self.normalized_words(self.confirmed_words)
-        words_normalized = self.normalized_words(words)
-        if words_normalized[:len(confirmed_normalized)] == confirmed_normalized:
-            new_words = words[len(self.confirmed_words):]
-        else:
-            overlap = 0
-            for size in range(min(len(confirmed_normalized), len(words_normalized)), 0, -1):
-                if confirmed_normalized[-size:] == words_normalized[:size]:
-                    overlap = size
-                    break
-            new_words = words[overlap:]
-        self.confirmed_words.extend(new_words)
-        return " ".join(new_words)
-
     def transcribe_final(self, audio_data, engine):
         wav_file = None
         try:
@@ -482,9 +422,8 @@ class SallySpeechV6(QMainWindow):
                 with self.gigaam_inference_lock:
                     text = self.transcribe_gigaam_file(self.get_gigaam_model(), wav_file)
                 self.update_preview.emit(text or "Тишина")
-                new_text = self.final_new_words(text)
-                if new_text:
-                    self.request_paste.emit(new_text + " ")
+                if text:
+                    self.request_paste.emit(text + " ")
             else:
                 text = self.transcribe_groq(wav_file)
                 if text:
